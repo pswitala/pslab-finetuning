@@ -1,0 +1,44 @@
+# ============================================================
+# Qwen3.6-27B Polish fine-tuning — Python dependencies
+# Target env: Ubuntu, vllm venv, torch==2.10.0, CUDA 12.8/12.9
+#
+# ALREADY IN YOUR VENV — do not reinstall:
+#   torch==2.10.0  transformers==5.5.0  tokenizers==0.22.2
+#   sentencepiece==0.2.1  protobuf==6.33.6  safetensors==0.7.0
+#   huggingface_hub==1.9.0  numpy==2.2.6  tqdm==4.67.3
+#   PyYAML==6.0.3  requests==2.33.1  python-dotenv==1.2.2
+#   flashinfer-python==0.6.6  gguf==0.18.0  vllm==0.19.0
+#   triton==3.6.0  regex==2026.4.4
+#
+# INSTALL WITH:
+#   pip install -r requirements.txt
+# ============================================================
+
+# --- Training core (missing from vllm venv) ---
+peft>=0.14
+trl>=0.15
+accelerate>=1.0
+bitsandbytes>=0.44          # 4-bit NF4 quantization; verify it finds CUDA 12.9
+
+# --- Data (missing from vllm venv) ---
+datasets>=4.8
+pyarrow>=15.0
+zstandard>=0.22
+
+# --- Corpus processing ---
+datatrove>=0.3              # language-ID, quality filter, MinHash dedup
+trafilatura>=2.0            # HTML → clean text
+
+# --- Evaluation ---
+lm-eval>=0.4                # EleutherAI lm-evaluation-harness (Polish tasks)
+
+# --- Notes on packages NOT needed here ---
+# flash-attn    : replaced by flashinfer-python==0.6.6 (already installed)
+# gguf          : already installed (0.18.0) — used by export_gguf.py
+# vllm          : already installed (0.19.0) — used for fast inference / eval
+# unsloth       : optional; install separately if Qwen3.6 (qwen3_5 arch) support lands
+#                 pip install unsloth
+# fasttext lid  : pip install fasttext-wheel
+#                 wget https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin -P data/models/
+# kenlm         : pip install https://github.com/kpu/kenlm/archive/master.zip
+# wandb         : pip install wandb  (optional experiment tracking)

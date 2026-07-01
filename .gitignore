@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.ipynb_checkpoints/
+
+# Secrets / config
+.env
+*.local
+
+# Data & model artifacts (large — keep out of git)
+data/raw/
+data/interim/
+data/processed/
+data/catalogs/
+models/
+*.gguf
+*.safetensors
+*.bin
+
+# Eval & logs
+eval/results/
+logs/
+wandb/
+mlruns/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+
+plans

@@ -1,0 +1,48 @@
+# Preference Optimization (DPO) config — QLoRA via Unsloth + TRL DPOTrainer.
+# Starts from the merged SFT checkpoint.
+#
+# See cpt.yaml header for full architecture notes.
+
+base_model: models/sft/merged
+max_seq_len: 4096
+load_in_4bit: true
+enable_thinking: false
+
+lora:
+  r: 32
+  alpha: 64
+  dropout: 0.05
+  use_rslora: true
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - in_proj_qkv
+    - out_proj
+    - in_proj_z
+    - in_proj_a
+    - in_proj_b
+    - gate_proj
+    - up_proj
+    - down_proj
+
+train_files: data/processed/dpo/train.jsonl
+eval_files: data/processed/dpo/val.jsonl
+
+beta: 0.1
+loss_type: sigmoid
+learning_rate: 5.0e-6
+lr_scheduler: cosine
+warmup_ratio: 0.05
+num_train_epochs: 1
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 8
+gradient_checkpointing: true
+bf16: true
+
+output_dir: models/dpo
+save_steps: 100
+eval_steps: 100
+logging_steps: 10
+seed: 3407

@@ -1,0 +1,88 @@
+# Continued Pretraining (CPT) config — QLoRA via Unsloth (or TRL+PEFT fallback).
+#
+# === CRITICAL ARCHITECTURE NOTES (verified 2026-06) ===
+# Model:  Qwen/Qwen3.6-27B  (Apache 2.0, 27B dense, 64 layers, 262K ctx)
+# Arch:   SSM-HYBRID — 16 × (3× Gated DeltaNet + 1× Gated Attention)
+#         75% of layers are linear/SSM attention (linear_attn.*), only 25% are
+#         standard attention (self_attn.*). Must target BOTH in LoRA.
+# VLM:    Qwen3_5ForConditionalGeneration — has vision encoder. It is frozen
+#         automatically in _common.py; only text layers are trained.
+# Base:   NO BASE checkpoint published — only instruct. CPT starts from the
+#         instruct model. Use a LOWER LR (3e-5 not 1e-4) and keep EN replay
+#         high to avoid undoing alignment.
+# Think:  Model generates <think> tokens by default. For raw-text CPT this is
+#         irrelevant (no chat template applied), but SFT/DPO must disable it.
+# Unsloth: FastQwen3_5Model / Qwen3.6 support is NOT confirmed in Unsloth as of
+#         planning time. _common.py will fall back to TRL+PEFT automatically.
+
+base_model: Qwen/Qwen3.6-27B
+max_lentg: 4096          # safe default; 96 GB allows ~8192 — raise after a pilot
+load_in_4bit: true         # NF4; or NVFP4 if bitsandbytes gains Blackwell support
+
+# LoRA — covers both attention types + MLP.
+# Full-attention layers  (every 4th): self_attn.{q,k,v,o}_proj
+# Linear-attention/SSM   (other 3/4): linear_attn.{in_proj_qkv, in_proj_z,
+#                                      in_proj_a, in_proj_b, out_proj}
+# MLP (all layers): mlp.{gate,up,down}_proj
+lora:
+  r: 64
+  alpha: 128
+  dropout: 0.05
+  use_rslora: true
+  use_dora: false
+  target_modules:
+    # Standard attention (16 layers)
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    # SSM / linear-attention projections (48 layers — do NOT skip these)
+    - in_proj_qkv
+    - out_proj
+    - in_proj_z
+    # The next two touch SSM state-space internals — included for deeper adaptation;
+    # remove them for a more conservative run.
+    - in_proj_a
+    - in_proj_b
+    # MLP (all 64 layers)
+    - gate_proj
+    - up_proj
+    - down_proj
+
+# Data: packed parquet produced by scripts/process/build_cpt_mix.py
+train_files: data/processed/cpt/train/*.parquet
+eval_files: data/processed/cpt/val/*.parquet
+replay_fraction: 0.18      # 15-20% EN replay — critical given no base model
+
+# Packing: enabled for CPT efficiency (~8x fewer steps than packing=false).
+# flash-linear-attention + causal-conv1d are installed so SSM layers use fast kernels.
+# Cross-document attention contamination is a tolerable noise for raw-text CPT.
+# NOTE: SFT must use packing=false (response-masking breaks across document boundaries).
+packing: true
+
+# Optimization — conservative: starting from instruct, not base
+learning_rate: 3.0e-5      # lower than typical CPT to preserve alignment
+lr_scheduler: cosine
+warmup_ratio: 0.05
+num_train_epochs: 1
+
+weight_decay: 0.01
+gradient_checkpointing: true
+bf16: true
+
+output_dir: models/cpt
+save_steps: 500
+eval_steps: 2000
+logging_steps: 20
+english_retention_check: true   # run small EN benchmark every eval step
+
+seed: 3407
+
+#pilot run
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 32
+max_steps: 200
+
+#full run remove max_steps
+#per_device_train_batch_size: 2
+#gradient_accumulation_steps: 16
