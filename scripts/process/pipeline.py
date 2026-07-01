@@ -57,9 +57,14 @@ def build_pipeline(input_glob: str, output_dir: str, lang_threshold: float):
                     self.stat_update(f"dropped:{res.reason.split('(')[0]}")
 
     parts = Path(input_glob).parts
-    star_idx = next(i for i, p in enumerate(parts) if "*" in p)
-    data_folder = str(Path(*parts[:star_idx]))
-    glob_pattern = str(Path(*parts[star_idx:]))
+    star_idx = next((i for i, p in enumerate(parts) if "*" in p), None)
+    if star_idx is None:
+        # No wildcard: treat input as a directory and match all jsonl underneath.
+        data_folder = input_glob
+        glob_pattern = "**/*.jsonl"
+    else:
+        data_folder = str(Path(*parts[:star_idx]))
+        glob_pattern = str(Path(*parts[star_idx:]))
 
     return [
         JsonlReader(data_folder=data_folder, glob_pattern=glob_pattern),

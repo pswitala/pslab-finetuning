@@ -244,3 +244,13 @@ xxhash==3.8.0
 yarl==1.23.0
 zipp==3.23.0
 zstandard==0.25.0
+
+# --- experiment tracking (imported by scripts/train/*, gated on WANDB_API_KEY) ---
+wandb==0.18.7
+
+# --- OPTIONAL backends: NOT pip-installable cleanly on Blackwell; install manually ---
+# Unsloth (fast training path in scripts/train/_common.py; PEFT fallback works without it):
+#   pip install "unsloth[cu128] @ git+https://github.com/unslothai/unsloth.git"
+# llama-cpp-python (GGUF eval/smoke backends: catalog_eval/agentic_eval --backend gguf):
+#   CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python
+# NOTE: never install flash-attn — it conflicts with flashinfer on Blackwell.

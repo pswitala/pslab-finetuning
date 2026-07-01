@@ -1,0 +1,22 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install light test deps
+        # The pure-logic unit tests don't need the GPU/training stack — only these.
+        run: pip install ruff pytest jsonschema pyyaml requests
+      - name: Ruff
+        run: ruff check scripts tests
+      - name: Pytest
+        run: pytest

@@ -5,7 +5,7 @@
 # Set lora.target_modules: auto for automatic projection detection,
 # or see configs/models/ for per-architecture presets.
 
-base_model: /home/pswitala/models/cpt-merged     # or any HF model ID / local path
+base_model: models/cpt/merged     # merged CPT checkpoint (repo-relative); or any HF model ID / local path
 max_seq_len: 4096
 load_in_4bit: true
 enable_thinking: false            # disable <think> blocks in training labels (Qwen-specific; ignored by others)
@@ -29,7 +29,7 @@ lora:
 
 train_files: data/processed/sft/train.jsonl
 eval_files: data/processed/sft/val.jsonl
-english_instruction_fraction: 0.10
+english_instruction_fraction: 0.10   # consumed by scripts/process/build_sft_qa.py (dataset mixing), not the trainer
 
 learning_rate: 2.0e-4
 lr_scheduler: cosine

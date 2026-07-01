@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
-"""Verify the training environment is usable on the Blackwell GPU.
+"""Verify the training environment is usable.
 
 Run this FIRST, before any training:
     python scripts/check_env.py
 
+Defaults target the reference rig (RTX 6000 Pro Blackwell, sm_120, ~96 GB), but the
+thresholds are configurable so the check works on any GPU:
+    python scripts/check_env.py --min-vram 24 --min-compute 8.0
+
 Checks:
   - torch + CUDA versions
-  - GPU name, compute capability (expect sm_120 / 12.0 for RTX 6000 Pro Blackwell)
-  - available VRAM (expect ~96 GB)
-  - a tiny bf16 matmul actually runs on the GPU (confirms kernels exist for sm_120)
-  - presence of key libraries (unsloth, transformers, trl, peft, bitsandbytes)
+  - GPU name, compute capability, available VRAM (warns below thresholds)
+  - a tiny bf16 matmul actually runs on the GPU (confirms kernels exist for this arch)
+  - presence of key libraries (training + eval/export backends)
 """
 
 from __future__ import annotations
 
+import argparse
 import importlib
 import sys
 
@@ -27,9 +31,17 @@ def _check_lib(name: str) -> str:
 
 
 def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--min-vram", type=float, default=70.0,
+                    help="warn if total VRAM is below this many GB (default 70)")
+    ap.add_argument("--min-compute", type=float, default=9.0,
+                    help="warn if compute capability is below this (default 9.0 = Hopper)")
+    args = ap.parse_args()
+
     print("== Library versions ==")
+    # Training libs are required; eval/export backends (vllm, llama_cpp) are optional.
     for lib in ("torch", "transformers", "trl", "peft", "bitsandbytes", "unsloth",
-                "datasets", "accelerate", "datatrove", "lm_eval"):
+                "datasets", "accelerate", "datatrove", "lm_eval", "vllm", "llama_cpp"):
         print(f"  {lib:14s} {_check_lib(lib)}")
 
     try:
@@ -57,11 +69,13 @@ def main() -> int:
     print(f"  compute capability  sm_{cap[0]}{cap[1]} ({cap[0]}.{cap[1]})")
     print(f"  total VRAM          {total_gb:.1f} GB")
 
-    if cap[0] < 9:
-        print("  WARNING: pre-Hopper GPU; this project targets Blackwell (sm_120).")
-    if total_gb < 70:
-        print("  WARNING: < 70 GB VRAM. The 27B QLoRA recipe assumes ~96 GB; "
-              "reduce seq len / batch or use a smaller model.")
+    if (cap[0] + cap[1] / 10) < args.min_compute:
+        print(f"  WARNING: compute capability {cap[0]}.{cap[1]} < {args.min_compute}; "
+              "the reference recipe targets Blackwell (sm_120). bf16/kernels may be slow "
+              "or unsupported.")
+    if total_gb < args.min_vram:
+        print(f"  WARNING: {total_gb:.1f} GB VRAM < {args.min_vram} GB. The 27B QLoRA "
+              "recipe assumes ~96 GB; reduce seq len / batch or use a smaller model.")
 
     # Confirm kernels actually run for this architecture.
     print("\n== bf16 matmul smoke test ==")

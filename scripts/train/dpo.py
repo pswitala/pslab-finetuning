@@ -20,7 +20,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import load_config, load_model_and_tokenizer, load_for_merge, merge_and_save  # noqa: E402
+from _common import (  # noqa: E402
+    load_config, load_model_and_tokenizer, load_for_merge, merge_and_save, wandb_report_to,
+)
 
 
 def load_pref_dataset(files_glob: str, tokenizer):
@@ -30,23 +32,13 @@ def load_pref_dataset(files_glob: str, tokenizer):
         raise FileNotFoundError(f"no files match {files_glob}")
     ds = load_dataset("json", data_files=paths, split="train")
 
-    def render(ex):
-        prompt = ex["prompt"]
-        chosen = ex["chosen"]
-        rejected = ex["rejected"]
-
-        # Conversational format (e.g. Dolci-Instruct-DPO-translated):
-        #   prompt = list of {role, content} dicts
-        #   chosen / rejected = list of {role, content} dicts (single-item: the response)
-        # TRL DPOTrainer >= 0.15 handles this natively — return as-is so the
-        # format stays consistent (mixing str prompt with list chosen/rejected breaks TRL).
-        if isinstance(prompt, list) and isinstance(chosen, (list, dict)):
-            return {"prompt": prompt, "chosen": chosen, "rejected": rejected}
-
-        # Standard flat format: all are plain strings — also pass through.
-        return {"prompt": prompt, "chosen": chosen, "rejected": rejected}
-
-    return ds.map(render)
+    # Both supported input shapes are passed through unchanged:
+    #   - Conversational (e.g. Dolci-Instruct-DPO-translated): prompt is a list of
+    #     {role, content} dicts; chosen/rejected are lists/dicts.
+    #   - Standard flat: prompt/chosen/rejected are plain strings.
+    # TRL DPOTrainer >= 0.15 handles both natively, so no per-example transform is
+    # needed. (Mixing a str prompt with list chosen/rejected within one file breaks TRL.)
+    return ds
 
 
 def main() -> int:
@@ -100,6 +92,7 @@ def main() -> int:
         eval_steps=cfg.get("eval_steps", 100) if eval_ds else None,
         eval_strategy="steps" if eval_ds else "no",
         seed=cfg.get("seed", 3407),
+        report_to=wandb_report_to(),
     )
     trainer = DPOTrainer(
         model=loaded.model,

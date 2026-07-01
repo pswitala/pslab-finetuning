@@ -1,0 +1,24 @@
+# Tooling config for the pslab-finetuning pipeline.
+# Not a packaged module — this file only configures ruff / black / pytest.
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# E402 (import-not-at-top) is intentional: scripts do sys.path.insert before importing
+# sibling packages. BLE001 (blind-except) is used deliberately around optional backends.
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E402", "E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/**" = ["B008"]  # argparse/default-in-call patterns
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["scripts"]

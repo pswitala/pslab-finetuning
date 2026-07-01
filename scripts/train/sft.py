@@ -22,12 +22,14 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import load_config, load_model_and_tokenizer, load_for_merge, merge_and_save  # noqa: E402
+from _common import (  # noqa: E402
+    load_config, load_model_and_tokenizer, load_for_merge, merge_and_save, wandb_report_to,
+)
 
 
 def _to_messages(ex: dict) -> dict:
     if "messages" in ex:
-        return ex
+        return ex   # preserves an optional top-level "tools" list for tool-use samples
     user = ex.get("instruction", "")
     if ex.get("input"):
         user = f"{user}\n\n{ex['input']}"
@@ -35,58 +37,68 @@ def _to_messages(ex: dict) -> dict:
                          {"role": "assistant", "content": ex.get("output", "")}]}
 
 
+def _render_chat(tokenizer, messages, tools, enable_thinking: bool) -> str:
+    """Render one conversation to text, passing `tools` when present.
+
+    enable_thinking=False suppresses <think> blocks in the labels (instruct models
+    generate them by default). Progressively drops kwargs the tokenizer doesn't accept:
+    enable_thinking first (older tokenizers), then tools (non-tool-capable templates).
+    """
+    kwargs = {"tokenize": False, "add_generation_prompt": False}
+    if tools:
+        kwargs["tools"] = tools
+    try:
+        return tokenizer.apply_chat_template(
+            messages, enable_thinking=enable_thinking, **kwargs)
+    except TypeError:
+        try:
+            return tokenizer.apply_chat_template(messages, **kwargs)
+        except TypeError:
+            kwargs.pop("tools", None)   # template predates tool support
+            return tokenizer.apply_chat_template(messages, **kwargs)
+
+
 def load_chat_dataset(files_glob: str, tokenizer, enable_thinking: bool = False):
-    from datasets import load_dataset, Dataset
+    """Read chat/tool-use jsonl and render to a flat {'text': ...} dataset.
+
+    Records are read + rendered in Python (not via load_dataset's arrow inference) so the
+    deeply-nested, heterogeneous `messages`/`tools`/`tool_calls.arguments` structures —
+    which arrow cannot unify across plain-chat and tool-use rows — never reach a columnar
+    schema. Only the final flat `text` column is materialized.
+    """
+    import json as _json
+    from datasets import Dataset
+
     paths = glob.glob(files_glob, recursive=True)
     if not paths:
         raise FileNotFoundError(f"no files match {files_glob}")
 
-    try:
-        ds = load_dataset("json", data_files=paths, split="train")
-    except Exception as exc:
-        # train.jsonl mixes dolci-sft records {id, messages} with catalog_qa records
-        # that also carry {source, license, snapshot_date}. The datasets library infers
-        # schema from the first batch and fails to cast later records with extra columns.
-        # Fall back to line-by-line loading, keeping only the messages column.
-        import json as _json
-        print(f"[sft] schema mismatch in source files ({exc.__class__.__name__}: {exc}); "
-              "falling back to line-by-line loader (keeps only 'messages' column)")
-        rows: list[dict] = []
-        for path in paths:
-            with open(path, encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = _json.loads(line)
-                    except _json.JSONDecodeError:
-                        continue
-                    if "messages" in rec:
-                        rows.append({"messages": rec["messages"]})
-        ds = Dataset.from_list(rows)
-        print(f"[sft] loaded {len(ds):,} examples via fallback")
+    rows: list[dict] = []
+    n_tool = 0
+    for path in paths:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = _json.loads(line)
+                except _json.JSONDecodeError:
+                    continue
+                ex = _to_messages(rec)
+                if "messages" not in ex:
+                    continue
+                tools = ex.get("tools")
+                if tools:
+                    n_tool += 1
+                rows.append({"text": _render_chat(
+                    tokenizer, ex["messages"], tools, enable_thinking)})
 
-    ds = ds.map(_to_messages)
-
-    def render(ex):
-        # enable_thinking=False suppresses <think> blocks so they don't appear
-        # in training labels. The model was instruct-trained with thinking on by
-        # default; turning it off here gives clean Polish instruction-following data.
-        try:
-            text = tokenizer.apply_chat_template(
-                ex["messages"],
-                tokenize=False,
-                add_generation_prompt=False,
-                enable_thinking=enable_thinking,
-            )
-        except TypeError:
-            # Older tokenizer versions don't accept enable_thinking; fall back.
-            text = tokenizer.apply_chat_template(
-                ex["messages"], tokenize=False, add_generation_prompt=False)
-        return {"text": text}
-
-    return ds.map(render, remove_columns=[c for c in ds.column_names if c != "text"])
+    if not rows:
+        raise FileNotFoundError(f"no usable records in {files_glob}")
+    print(f"[sft] loaded {len(rows):,} examples ({n_tool:,} tool-use) from "
+          f"{len(paths)} file(s)")
+    return Dataset.from_list(rows)
 
 
 def main() -> int:
@@ -102,7 +114,6 @@ def main() -> int:
         return 0
 
     loaded = load_model_and_tokenizer(cfg)
-    _maybe_set_chat_template(loaded, cfg)
     print(f"[sft] backend={loaded.backend} base={cfg['base_model']}")
 
     from trl import SFTTrainer, SFTConfig
@@ -134,6 +145,7 @@ def main() -> int:
         eval_steps=cfg.get("eval_steps", 200) if eval_ds else None,
         eval_strategy="steps" if eval_ds else "no",
         seed=cfg.get("seed", 3407),
+        report_to=wandb_report_to(),
     )
     trainer = SFTTrainer(model=loaded.model, processing_class=loaded.tokenizer,
                          train_dataset=train_ds, eval_dataset=eval_ds, args=sft_cfg)
@@ -165,12 +177,6 @@ def main() -> int:
     trainer.save_model(cfg["output_dir"])
     print(f"[sft] done -> {cfg['output_dir']}")
     return 0
-
-
-def _maybe_set_chat_template(loaded, cfg) -> None:
-    # Use the model's built-in chat_template as-is.
-    # Override by setting tokenizer.chat_template directly if needed.
-    pass
 
 
 if __name__ == "__main__":

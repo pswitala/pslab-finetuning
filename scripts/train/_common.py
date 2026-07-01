@@ -25,8 +25,23 @@ def load_config(path: str) -> dict[str, Any]:
         return yaml.safe_load(fh)
 
 
+def wandb_report_to() -> list[str]:
+    """['wandb'] if WANDB_API_KEY is set, else [] — for SFTConfig/DPOConfig report_to.
+
+    Shared by cpt/sft/dpo so experiment tracking is enabled consistently across stages.
+    """
+    import os
+    return ["wandb"] if os.environ.get("WANDB_API_KEY") else []
+
+
+# Attention projection patterns. Fused-QKV variants (Phi-3, MPT, Falcon, GPT-2) are
+# listed alongside the split variant; _resolve_target_modules picks the pattern with the
+# MOST matches, so an arch that has both `o_proj` and `qkv_proj` (Phi-3) correctly
+# selects the fused pattern instead of just `o_proj`.
 _ATTN_PATTERNS = [
     ["q_proj", "k_proj", "v_proj", "o_proj"],   # Llama, Mistral, Qwen attn, Gemma
+    ["qkv_proj", "o_proj"],                        # Phi-3 (fused QKV)
+    ["Wqkv", "out_proj"],                         # MPT / some fused-QKV archs
     ["c_attn", "c_proj"],                         # GPT-2 / GPT-NeoX (fused QKV)
     ["to_q", "to_k", "to_v", "to_out"],           # Diffusers / DiT
     ["query", "key", "value", "dense"],            # BERT / RoBERTa
@@ -34,6 +49,7 @@ _ATTN_PATTERNS = [
 ]
 _MLP_PATTERNS = [
     ["gate_proj", "up_proj", "down_proj"],         # Llama / Mistral / Qwen MLP
+    ["gate_up_proj", "down_proj"],                 # Phi-3 (fused gate/up)
     ["fc1", "fc2"],                                # GPT-2 / BERT MLP
     ["w1", "w2", "w3"],                            # some custom architectures
 ]
@@ -43,27 +59,34 @@ _SSM_CANDIDATES = [
 ]
 
 
+def _best_pattern(patterns: list[list[str]], names: set[str]) -> list[str]:
+    """Return the pattern with the most leaf-name matches (ties -> earliest listed)."""
+    best: list[str] = []
+    best_hits = 0
+    for pat in patterns:
+        hits = [p for p in pat if p in names]
+        if len(hits) > best_hits:
+            best, best_hits = hits, len(hits)
+    return best
+
+
 def _resolve_target_modules(model: Any, cfg_modules: Any) -> list[str] | Any:
     """Return resolved LoRA target_modules list.
 
-    "auto" → inspect model.named_modules() for common projection patterns.
+    "auto" → inspect model.named_modules() and pick the best-matching attention + MLP
+             projection pattern (by number of matches), plus any SSM projections.
     list   → returned unchanged (user override).
-    Falls back to ["q_proj", "v_proj"] if nothing detected.
+
+    Raises ValueError if "auto" detects nothing — silently targeting nonexistent
+    modules (the old ["q_proj","v_proj"] fallback) produces a broken/no-op adapter on
+    fused-QKV architectures, so we fail loudly with guidance instead.
     """
     if cfg_modules != "auto":
         return cfg_modules
     names = {n.split(".")[-1] for n, _ in model.named_modules()}
     detected: list[str] = []
-    for pat in _ATTN_PATTERNS:
-        hits = [p for p in pat if p in names]
-        if hits:
-            detected.extend(hits)
-            break
-    for pat in _MLP_PATTERNS:
-        hits = [p for p in pat if p in names]
-        if hits:
-            detected.extend(hits)
-            break
+    detected.extend(_best_pattern(_ATTN_PATTERNS, names))
+    detected.extend(_best_pattern(_MLP_PATTERNS, names))
     detected.extend(p for p in _SSM_CANDIDATES if p in names)
     seen: set[str] = set()
     unique: list[str] = []
@@ -74,9 +97,13 @@ def _resolve_target_modules(model: Any, cfg_modules: Any) -> list[str] | Any:
     if unique:
         print(f"[_common] auto-detected target_modules: {unique}")
         return unique
-    print("[_common] WARNING: auto-detection found nothing; falling back to ['q_proj','v_proj']. "
-          "Set lora.target_modules explicitly.")
-    return ["q_proj", "v_proj"]
+    sample = sorted(n for n in names if "proj" in n or "attn" in n or "fc" in n)
+    raise ValueError(
+        "target_modules: auto detected no known projection modules for this "
+        "architecture. Set lora.target_modules explicitly in the config "
+        "(see configs/models/ for presets). Candidate leaf module names found: "
+        f"{sample or sorted(names)[:40]}"
+    )
 
 
 @dataclass
@@ -117,7 +144,18 @@ def load_model_and_tokenizer(cfg: dict) -> LoadedModel:
         _maybe_freeze_vision_encoder(model, cfg)
         return LoadedModel(model, tokenizer, "unsloth")
     except Exception as exc:  # noqa: BLE001
-        print(f"[_common] Unsloth unavailable for this model ({exc}); using PEFT fallback.")
+        # OOM won't be fixed by the PEFT fallback — surface it instead of masking it.
+        import torch
+        if isinstance(exc, (MemoryError, torch.cuda.OutOfMemoryError)):
+            raise
+        # Anything else (Unsloth not installed / unsupported arch / bad kwarg): log the
+        # full reason loudly, then fall back to PEFT. Silent fallback hid real bugs.
+        import traceback
+        print("[_common] " + "=" * 68)
+        print(f"[_common] Unsloth path failed ({exc.__class__.__name__}: {exc}); "
+              "falling back to PEFT + bitsandbytes.")
+        traceback.print_exc()
+        print("[_common] " + "=" * 68)
         return _load_peft_fallback(cfg)
 
 
@@ -154,11 +192,13 @@ def _load_peft_fallback(cfg: dict) -> LoadedModel:
         trust_remote_code=True,
     )
     model = None
+    used_cls_name = None
     last_exc = None
     for cls_name in _MODEL_LOADERS:
         try:
             cls = getattr(importlib.import_module("transformers"), cls_name)
             model = cls.from_pretrained(cfg["base_model"], **load_kwargs)
+            used_cls_name = cls_name
             print(f"[_common] loaded with {cls_name}")
             break
         except Exception as exc:  # noqa: BLE001
@@ -176,7 +216,9 @@ def _load_peft_fallback(cfg: dict) -> LoadedModel:
         model = prepare_model_for_kbit_training(
             model, use_gradient_checkpointing=cfg.get("gradient_checkpointing", True))
 
-    # PEFT task_type: CAUSAL_LM works for text generation models including VLMs.
+    # PEFT task_type follows the loader that succeeded: SEQ_2_SEQ_LM for encoder-decoder
+    # models, CAUSAL_LM otherwise (decoder-only LMs and text-generation VLMs).
+    task_type = "SEQ_2_SEQ_LM" if used_cls_name == "AutoModelForSeq2SeqLM" else "CAUSAL_LM"
     target_modules = _resolve_target_modules(model, lora["target_modules"])
     peft_cfg = LoraConfig(
         r=lora["r"],
@@ -184,7 +226,7 @@ def _load_peft_fallback(cfg: dict) -> LoadedModel:
         lora_dropout=lora.get("dropout", 0.0),
         target_modules=target_modules,
         bias="none",
-        task_type="CAUSAL_LM",
+        task_type=task_type,
         use_rslora=lora.get("use_rslora", False),
         use_dora=lora.get("use_dora", False),
     )
@@ -231,18 +273,32 @@ def load_for_merge(cfg: dict) -> LoadedModel:
     The base model is loaded in bf16 (not 4-bit) because merge_and_unload requires
     full-precision base weights to produce a clean merged checkpoint.
     """
+    import importlib
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
     from peft import PeftModel
 
     adapter_dir = cfg["output_dir"]
     tokenizer = AutoTokenizer.from_pretrained(cfg["base_model"], trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg["base_model"],
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True,
-    )
+
+    load_kwargs = dict(torch_dtype=torch.bfloat16, device_map="auto",
+                       trust_remote_code=True)
+    model = None
+    last_exc = None
+    for cls_name in _MODEL_LOADERS:   # same arch-flexible order as the training loader
+        try:
+            cls = getattr(importlib.import_module("transformers"), cls_name)
+            model = cls.from_pretrained(cfg["base_model"], **load_kwargs)
+            print(f"[_common] merge base loaded with {cls_name}")
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            print(f"[_common] {cls_name} failed ({exc.__class__.__name__}); trying next...")
+    if model is None:
+        raise RuntimeError(
+            f"Could not load {cfg['base_model']} for merge with any Auto class. "
+            f"Last error: {last_exc}"
+        ) from last_exc
     _maybe_freeze_vision_encoder(model, cfg)
     model = PeftModel.from_pretrained(model, adapter_dir)
     print(f"[_common] loaded trained adapter from {adapter_dir}")

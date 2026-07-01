@@ -1,13 +1,15 @@
 # Polish LLM Fine-Tuning Pipeline
 
-End-to-end QLoRA fine-tuning pipeline targeting Polish language fluency and factual
-knowledge from Polish open-data catalogs baked into model weights. Final artifact:
-**GGUF** files runnable in llama.cpp / Ollama.
+End-to-end QLoRA fine-tuning pipeline targeting Polish language fluency, factual
+knowledge from Polish open-data catalogs baked into model weights, and **agentic
+tool-use** (function calling grounded in the real GUS / dane.gov.pl / ISAP APIs). Final
+artifact: **GGUF** files runnable in llama.cpp / Ollama.
 
 **Default model:** Qwen3.6-27B (SSM-hybrid VLM, 96 GB VRAM target). Set `BASE_MODEL`
 in `.env` to any HuggingFace model ID — the pipeline auto-detects LoRA target layers
-and freezes vision encoders only when present. See `configs/models/` for per-architecture
-presets (Llama-3, Phi-3, Mistral).
+(including fused-QKV architectures like Phi-3, and it now fails loudly rather than
+silently mis-targeting) and freezes vision encoders only when present. See
+`configs/models/` for per-architecture presets (Llama-3, Phi-3, Mistral).
 
 **Hardware:** 1× NVIDIA RTX 6000 Pro Blackwell, 96 GB VRAM (single GPU, QLoRA).
 
@@ -68,11 +70,19 @@ cp .env.example .env
 # Edit .env: set HF_TOKEN, optionally WANDB_API_KEY and WANDB_PROJECT
 ```
 
+`requirements.txt` also pins `wandb` (all three training stages log to Weights & Biases
+when `WANDB_API_KEY` is set) and documents the two optional special-install backends
+(`unsloth`, `llama-cpp-python`) in a trailing comment block.
+
 Verify the GPU and stack before doing anything else:
 
 ```bash
 python scripts/check_env.py
 # Expected: RTX 6000 Pro Blackwell, sm_120, ~96 GB, bf16 matmul OK
+# check_env also reports vllm / llama_cpp availability.
+
+# On a non-reference GPU, relax the warning thresholds:
+python scripts/check_env.py --min-vram 24 --min-compute 8.0
 ```
 
 ---
@@ -250,8 +260,15 @@ python scripts/process/dedup.py \
     --input data/interim/clean \
     --output data/interim/dedup \
     --workdir data/interim/_minhash \
-    --workers 16
+    --workers 16 \
+    --threshold 0.8
 ```
+
+`--threshold` now actually drives the LSH configuration: the target Jaccard similarity is
+converted to a MinHash band count (`num_buckets ≈ threshold^(-hashes_per_bucket)`) and
+passed into `MinhashConfig` (earlier versions accepted the flag but ignored it, silently
+using datatrove defaults). Tune the curve with `--hashes-per-bucket` (default 8) and
+`--n-grams` (default 5) if needed.
 
 ---
 
@@ -267,7 +284,7 @@ python scripts/process/dedup.py \
 
 **Why no tokenization at this stage:** The trainer uses `packing=True` during CPT, which concatenates documents with a separator token and packs them into full-length sequences. This is more efficient than pre-tokenizing: you avoid padding waste and the trainer can rebalance sequence lengths across batches. Pre-tokenizing would also couple the dataset to a specific `max_seq_len`, making it harder to experiment with different context lengths.
 
-**Why shuffle before writing:** The Polish and English documents are interleaved at the document level (not the batch level) so each training batch sees a mixture. If they were written as separate blocks, the model would oscillate between pure-Polish and pure-English training signals, which is worse for the replay mechanism.
+**Why streaming (not an in-memory shuffle):** The builder never loads the corpus into RAM. It makes two lightweight counting passes (to size the English replay), then a single writing pass that assigns each document to a random parquet shard and Bernoulli-samples the English stream down to the target fraction. Random shard assignment gives an approximate global shuffle — so Polish and English are interleaved at the document level and each batch sees a mixture — while scaling to the 400 GB+ corpus that an in-memory `shuffle()` could never hold. (The trainer also shuffles per epoch on top of this.)
 
 ```bash
 python scripts/process/build_cpt_mix.py \
@@ -297,20 +314,52 @@ python scripts/process/build_sft_qa.py \
     --out data/processed/sft/catalog_qa.jsonl \
     --mode template --per-record 2
 
-# Merge with downloaded instruction datasets
+# Merge with downloaded instruction datasets (+ agentic data from 4b-bis below)
 cat data/raw/dolci-sft-pl/data.jsonl \
     data/processed/sft/catalog_qa.jsonl \
+    data/processed/sft/agentic/tool_qa.jsonl \
     > data/processed/sft/train.jsonl
 # Create a small val split (e.g. first 1000 lines)
 head -1000 data/processed/sft/train.jsonl > data/processed/sft/val.jsonl
 ```
 
-#### 4c. DPO preference dataset
+#### 4b-bis. Agentic (tool-use) dataset (`build_sft_qa.py --mode agentic`)
+
+**What it does:** Generates deterministic tool-use trajectories grounded in the *same* APIs
+the catalog records came from. Each sample is a full function-calling conversation — user
+question → assistant `tool_calls` → `role:"tool"` result → final grounded answer — plus the
+`tools` schema. This is what teaches the model to *call tools*, the third project goal
+alongside Polish fluency and knowledge injection.
+
+**Why grounded in real APIs (not hallucinated tools):** `scripts/common/tool_catalog.py`
+defines three function schemas (`gus_bdl_query`, `dane_gov_search`, `isap_lookup`) that mirror
+the GUS BDL / dane.gov.pl / ISAP endpoints already scraped in Step 1. The arguments in each
+training sample are filled from the record's real `meta` (subject/variable IDs, publisher/year/
+position, dataset titles), so the model learns argument shapes that map onto calls that
+actually exist. Every generated sample is validated against the tool's JSON Schema
+(`scripts/common/tooling.py`) and dropped if it doesn't conform. All three tools are offered on
+every sample, so the model also learns tool *selection*, not just argument filling.
 
 ```bash
-cp data/raw/dolci-dpo-pl/data.jsonl data/processed/dpo/train.jsonl
-# val split
-head -500 data/processed/dpo/train.jsonl > data/processed/dpo/val.jsonl
+python scripts/process/build_sft_qa.py \
+    --input "data/catalogs/**/*.jsonl" \
+    --out data/processed/sft/agentic/tool_qa.jsonl \
+    --mode agentic --per-record 2
+```
+
+#### 4c. DPO preference dataset (`build_dpo.py`)
+
+**What it does:** Validates and filters the Dolci-DPO pairs instead of copying them verbatim.
+The raw dump contains malformed pairs (empty responses, `chosen == rejected`, exact
+duplicates) that add no preference signal or actively hurt training; `build_dpo.py` drops
+those and writes a clean train/val split that `scripts/train/dpo.py` consumes directly.
+
+```bash
+python scripts/process/build_dpo.py \
+    --input data/raw/dolci-dpo-pl/data.jsonl \
+    --out data/processed/dpo \
+    --val 500
+# Output: data/processed/dpo/train.jsonl + val.jsonl
 ```
 
 ---
@@ -374,10 +423,10 @@ After the 200-step CPT pilot, run the quick Polish eval to confirm nothing is br
 ```bash
 # With PEFT adapter (fast — base loads from HF cache):
 python scripts/eval/run_eval.py --peft models/cpt --suite polish_quick \
-    --base-model /home/pswitala/models/cpt-merged
+    --base-model Qwen/Qwen3.6-27B
 
-# Or after merging (if model lives on Linux fs):
-python scripts/eval/run_eval.py --model /home/pswitala/models/cpt-merged --suite polish_quick
+# Or after merging:
+python scripts/eval/run_eval.py --model models/cpt/merged --suite polish_quick
 ```
 
 Observed results from the CPT pilot run on this machine:
@@ -409,7 +458,7 @@ Observed results from the CPT pilot run on this machine:
 
 **Why QLoRA (not full fine-tuning):** At 27B parameters and bf16 precision, the model alone occupies ~54 GB of VRAM. Full fine-tuning requires optimizer states (Adam: 2× model size) on top — well over 96 GB. QLoRA loads the base model in 4-bit NF4 (~14 GB), keeps frozen, and attaches trainable 16-bit LoRA adapters (~1-2 GB depending on rank). This fits comfortably within 96 GB while still adapting 27B parameters of representation capacity through the adapter layers.
 
-**Why `target_modules: auto`:** LoRA only updates the projection layers you name. For a pure-attention model (Llama, Mistral) the correct targets are `q_proj`, `k_proj`, `v_proj`, `o_proj`, and the MLP projections — leaving those out means the adapter can only influence 25–50% of the model's representation capacity. For SSM-hybrid models like Qwen3.6-27B, 75% of layers are linear-attention/SSM (`linear_attn.*`) with different projection names (`in_proj_qkv`, `in_proj_z`, `in_proj_a`, `in_proj_b`) — missing them effectively freezes 48 of 64 layers. `target_modules: auto` in the config inspects the loaded model's named modules and selects the right projections automatically. Override with an explicit list if auto-detection is wrong (see `configs/models/` for presets).
+**Why `target_modules: auto`:** LoRA only updates the projection layers you name. For a pure-attention model (Llama, Mistral) the correct targets are `q_proj`, `k_proj`, `v_proj`, `o_proj`, and the MLP projections — leaving those out means the adapter can only influence 25–50% of the model's representation capacity. For SSM-hybrid models like Qwen3.6-27B, 75% of layers are linear-attention/SSM (`linear_attn.*`) with different projection names (`in_proj_qkv`, `in_proj_z`, `in_proj_a`, `in_proj_b`) — missing them effectively freezes 48 of 64 layers. `target_modules: auto` in the config inspects the loaded model's named modules and selects the right projections automatically — including fused-QKV layouts (Phi-3's `qkv_proj` / `gate_up_proj`) via a best-match pattern. If it detects nothing it now raises with the candidate module names rather than silently falling back to modules that may not exist. Override with an explicit list for exotic architectures (see `configs/models/` for presets).
 
 **Why rsLoRA (`use_rslora: true`):** Standard LoRA scales the adapter output by `alpha/r`. At high rank (r=64), this scaling can cause gradient instability during the early warmup steps. rsLoRA replaces this with `alpha/sqrt(r)`, which remains stable across a wider range of ranks and makes it safe to use r=64 for CPT without careful per-run LR tuning.
 
@@ -443,6 +492,8 @@ python scripts/train/cpt.py --config configs/cpt.yaml --merge
 **Why configurable separator tokens:** The tokens that delimit user and assistant turns differ by model family. ChatML (`<|im_start|>user\n` / `<|im_start|>assistant\n`) is used by Qwen, Llama-3-Instruct, and Mistral v0.3+. Llama-2 uses `[INST]`/`[/INST]`; Phi-3 uses `<|user|>\n`/`<|assistant|>\n`. The `instruction_part` and `response_part` keys in `sft.yaml` expose these as config rather than hardcoding them. See the comments in `configs/sft.yaml` for common presets.
 
 **Why enable_thinking=False:** Qwen3.6-27B's chat template generates `<think>` tokens before answering by default. For SFT we want clean responses without thinking traces in the training labels (the Dolci-Instruct and catalog Q&A datasets don't contain thinking traces). `enable_thinking=False` is passed to `tokenizer.apply_chat_template()` with a `try/except TypeError` fallback — models whose tokenizer does not support this parameter (Llama, Mistral, Phi-3, etc.) silently ignore it.
+
+**Why tool-use samples train tool calls:** SFT records that carry a top-level `tools` list (produced by `build_sft_qa.py --mode agentic`) are rendered with `apply_chat_template(..., tools=...)`, so the tool schemas and the assistant `tool_calls` land in the training text and the model actually learns to emit function calls. The loader reads and renders records in Python (rather than via `load_dataset`'s columnar inference), which both enables the `tools` path and sidesteps the arrow schema-mismatch that mixed plain-chat / tool-use rows would otherwise trigger.
 
 **Why lower LR than CPT (2e-4 but still higher than CPT's 3e-5):** SFT is a smaller distributional shift than CPT — the model's weights are already adapted to Polish and we're now teaching response format and style. 2e-4 is standard for LoRA SFT. The reason it can be higher than CPT's 3e-5 is that CPT was starting from an instruct model whose alignment we wanted to preserve; at SFT time the model is already Polish-fluent and we want the instruction following to update more aggressively.
 
@@ -492,15 +543,17 @@ python scripts/train/dpo.py --config configs/dpo.yaml --merge
 
 ### Step 9 — Evaluate
 
-**What it does:** Measures the fine-tuned model on three axes: Polish language tasks (fluency, reasoning, knowledge), English retention (catastrophic forgetting check), and closed-book catalog knowledge (did the facts bake in?).
+**What it does:** Measures the fine-tuned model on four axes: Polish language tasks (fluency, reasoning, knowledge), English retention (catastrophic forgetting check), closed-book catalog knowledge (did the facts bake in?), and agentic tool-use (does it call the right tool with the right arguments?).
 
-**Why three separate evaluation suites:**
+**Why separate evaluation suites:**
 
 - **Polish suite:** The Open PL LLM Leaderboard benchmarks (PolEmo, KLEJ, Belebele PL, etc.) measure whether the model actually improved at Polish — fluency, reasoning, and cultural knowledge. Without this, you can't distinguish "model is more Polish" from "model is just more verbose in Polish."
 
 - **English retention:** Compares the fine-tuned model against the original Qwen/Qwen3.6-27B baseline on MMLU, HellaSwag, and ARC (English). The goal is that English scores don't drop more than 2–3 percentage points. If they drop more, the English replay fraction in CPT was insufficient.
 
-- **Catalog knowledge (closed-book):** Tests whether facts from legal acts, GUS statistics, and dane.gov.pl descriptions actually entered the model's weights. The holdout question set comes from catalog records deliberately excluded from training (`data/catalogs/_holdout/`). This is the most direct test of the core project goal — knowledge injection without RAG.
+- **Catalog knowledge (closed-book):** Tests whether facts from legal acts, GUS statistics, and dane.gov.pl descriptions actually entered the model's weights. The holdout question set comes from catalog records deliberately excluded from training — carved out reproducibly by `make_holdout.py` (stable per-id hash) into `data/catalogs/_holdout/`. This is the most direct test of the core project goal — knowledge injection without RAG. Scored with the numeric-aware `hybrid` scorer by default (or an LLM judge).
+
+- **Agentic tool-use:** Tests whether the model selects the correct tool and emits well-formed, correct arguments (validated against the JSON Schema). `agentic_eval.py` parses the emitted `tool_calls` and reports `tool_selection_acc`, `args_exact_acc`, and `schema_valid_rate` — directly measuring the tool-use goal rather than token overlap.
 
 ```bash
 # Polish tasks (Open PL LLM Leaderboard suite, Belebele PL, etc.)
@@ -520,17 +573,61 @@ python scripts/eval/run_eval.py \
     --suite english \
     --out eval/results/baseline
 
+# vllm backend — higher throughput (merged model only, incompatible with --peft):
+python scripts/eval/run_eval.py \
+    --model models/dpo/merged \
+    --suite polish \
+    --backend vllm
+
 # Closed-book catalog knowledge (facts baked into weights)
-# First build a held-out question set from catalog records kept out of training:
+# Carve out the holdout BEFORE training (run once, then feed the train split to Steps 1/4
+# so held-out facts never enter training):
+python scripts/process/make_holdout.py \
+    --input "data/catalogs/**/*.jsonl" \
+    --train-out data/catalogs_train \
+    --holdout-out data/catalogs/_holdout \
+    --fraction 0.02
+
+# Build a held-out question set from the records kept out of training:
 python scripts/process/build_sft_qa.py \
     --input "data/catalogs/_holdout/**/*.jsonl" \
     --out eval/data/catalog_qa_holdout.jsonl \
     --mode template --per-record 1
 
+# Score. Default scorer is `hybrid` — numeric-aware: when the reference contains numbers
+# (GUS statistics) it requires them, instead of rewarding copied prose. Other scorers:
+# overlap (old token-overlap), numeric, or llm (judge model via --judge-model/--judge-base-url).
 python scripts/eval/catalog_eval.py \
     --model models/dpo/merged \
     --qa eval/data/catalog_qa_holdout.jsonl \
+    --scorer hybrid \
     --out eval/results/catalog
+
+# vllm backend (batches all prompts at once — faster throughput):
+python scripts/eval/catalog_eval.py \
+    --model models/dpo/merged \
+    --qa eval/data/catalog_qa_holdout.jsonl \
+    --backend vllm
+
+# GGUF backend (--model is the .gguf file path):
+python scripts/eval/catalog_eval.py \
+    --model models/gguf/model-Q4_K_M.gguf \
+    --qa eval/data/catalog_qa_holdout.jsonl \
+    --backend gguf
+
+# Agentic (tool-use) eval — does the model emit the RIGHT tool call?
+# Build a tool-use holdout, then score tool selection, argument correctness, and schema validity:
+python scripts/process/build_sft_qa.py \
+    --input "data/catalogs/_holdout/**/*.jsonl" \
+    --out eval/data/agentic_holdout.jsonl \
+    --mode agentic --per-record 1
+
+python scripts/eval/agentic_eval.py \
+    --model models/dpo/merged \
+    --qa eval/data/agentic_holdout.jsonl \
+    --out eval/results/agentic
+# Reports: format_rate, tool_selection_acc, args_exact_acc, schema_valid_rate.
+# --backend {hf,vllm,gguf} as above.
 ```
 
 Results are written to `eval/results/`. Compare the fine-tuned model against
@@ -540,7 +637,9 @@ Results are written to `eval/results/`. Compare the fine-tuned model against
 
 ### Step 10 — Export to GGUF
 
-**What it does:** Converts the merged DPO model to GGUF format and quantizes it to multiple bit-widths. The GGUF files are the final deliverable — self-contained model files that run in llama.cpp and Ollama without any Python dependencies.
+**What it does:** Converts the **already-merged** DPO checkpoint to GGUF format and quantizes it to multiple bit-widths. The GGUF files are the final deliverable — self-contained model files that run in llama.cpp and Ollama without any Python dependencies.
+
+**Prerequisite — run the DPO stage with `--merge` first.** Export reads a merged checkpoint (default `<config output_dir>/merged`, i.e. `models/dpo/merged`; override with `--model-dir`). It no longer attaches a fresh LoRA adapter to the config's `base_model` — an earlier bug that silently exported the *pre-fine-tune* weights. If the merged dir is missing, the script errors and tells you to run `--merge`.
 
 **Why GGUF (not safetensors or ONNX):** GGUF is the universal format for llama.cpp and Ollama — the dominant serving stacks for self-hosted models. It embeds the tokenizer, chat template, and quantized weights in a single file, eliminating the need for a transformers install at inference time. ONNX is an alternative but requires ONNX Runtime, has weaker support for quantization at this scale, and doesn't natively support Qwen's SSM-hybrid architecture. Safetensors is the training format — keeping it means keeping the full bf16 model (~54 GB), which is impractical to distribute.
 
@@ -585,6 +684,25 @@ ollama run qwen-pl "Opisz krótko Konstytucję RP."
 
 ---
 
+## Development
+
+The `Makefile` gives one entrypoint per stage instead of copy-pasting commands — run
+`make help` to list targets (`make env`, `make dedup`, `make build-agentic`, `make cpt`,
+`make eval-agentic`, `make gguf`, …). Override paths with `VAR=value`.
+
+Pure-logic modules (license filtering, tool schemas + validation, LoRA target detection,
+tool-call parsing, dedup band math, Polish quality heuristics) have unit tests that need no
+GPU or training stack:
+
+```bash
+pip install ruff pytest jsonschema pyyaml requests   # light deps only
+make lint      # ruff check scripts tests
+make test      # pytest
+```
+
+`ruff`/`black`/`pytest` are configured in `pyproject.toml`, and `.github/workflows/ci.yml`
+runs lint + tests on every push and pull request.
+
 ## Quick reference — all commands in order
 
 ```bash
@@ -602,11 +720,15 @@ python scripts/ingest/gus_bdl.py   --subjects K11,K15,K27 --years 2010-2023 --ou
 
 # 3. process
 python scripts/process/pipeline.py --input "data/raw/**/*.jsonl" --output data/interim/clean --workers 16
-python scripts/process/dedup.py    --input data/interim/clean --output data/interim/dedup --workers 16
+python scripts/process/dedup.py    --input data/interim/clean --output data/interim/dedup --workers 16 --threshold 0.8
 
-# 4. datasets
-python scripts/process/build_cpt_mix.py --pl "data/interim/dedup/**/*.jsonl" "data/catalogs/**/*.jsonl" --en "data/raw/replay_en/**/*.jsonl" --out data/processed/cpt --commercial-safe
-python scripts/process/build_sft_qa.py  --input "data/catalogs/**/*.jsonl" --out data/processed/sft/catalog_qa.jsonl
+# 4. datasets  (carve the eval holdout out of catalogs first, before building anything)
+python scripts/process/make_holdout.py  --input "data/catalogs/**/*.jsonl" --train-out data/catalogs_train --holdout-out data/catalogs/_holdout --fraction 0.02
+python scripts/process/build_cpt_mix.py --pl "data/interim/dedup/**/*.jsonl" "data/catalogs_train/**/*.jsonl" --en "data/raw/replay_en/**/*.jsonl" --out data/processed/cpt --commercial-safe
+python scripts/process/build_sft_qa.py  --input "data/catalogs_train/**/*.jsonl" --out data/processed/sft/catalog_qa.jsonl --mode template
+python scripts/process/build_sft_qa.py  --input "data/catalogs_train/**/*.jsonl" --out data/processed/sft/agentic/tool_qa.jsonl --mode agentic
+python scripts/process/build_dpo.py     --input data/raw/dolci-dpo-pl/data.jsonl --out data/processed/dpo --val 500
+cat data/raw/dolci-sft-pl/data.jsonl data/processed/sft/catalog_qa.jsonl data/processed/sft/agentic/tool_qa.jsonl > data/processed/sft/train.jsonl
 
 # 5. pilot (small run — confirm stack works)
 python scripts/train/cpt.py --config configs/cpt.yaml   # with max_steps: 200
@@ -616,10 +738,13 @@ python scripts/train/cpt.py --config configs/cpt.yaml && python scripts/train/cp
 python scripts/train/sft.py --config configs/sft.yaml && python scripts/train/sft.py --config configs/sft.yaml --merge
 python scripts/train/dpo.py --config configs/dpo.yaml && python scripts/train/dpo.py --config configs/dpo.yaml --merge
 
-# 9. eval
+# 9. eval  (--backend vllm for faster throughput; --backend gguf for GGUF models)
 python scripts/eval/run_eval.py --model models/dpo/merged --suite polish
 python scripts/eval/run_eval.py --model models/dpo/merged --suite english
-python scripts/eval/catalog_eval.py --model models/dpo/merged --qa eval/data/catalog_qa_holdout.jsonl
+python scripts/process/build_sft_qa.py  --input "data/catalogs/_holdout/**/*.jsonl" --out eval/data/catalog_qa_holdout.jsonl --mode template --per-record 1
+python scripts/process/build_sft_qa.py  --input "data/catalogs/_holdout/**/*.jsonl" --out eval/data/agentic_holdout.jsonl --mode agentic --per-record 1
+python scripts/eval/catalog_eval.py --model models/dpo/merged --qa eval/data/catalog_qa_holdout.jsonl --scorer hybrid
+python scripts/eval/agentic_eval.py --model models/dpo/merged --qa eval/data/agentic_holdout.jsonl
 
 # 10. export
 python scripts/train/export_gguf.py --config configs/dpo.yaml --quants Q4_K_M Q5_K_M Q8_0 --out models/gguf
@@ -635,19 +760,24 @@ configs/          cpt.yaml  sft.yaml  dpo.yaml
   models/         qwen3_ssm.yaml  llama3.yaml  phi3.yaml  (LoRA presets)
 scripts/
   check_env.py
-  ingest/         sejm_isap.py  dane_gov.py  gus_bdl.py  culturax_pl.py
-  process/        pipeline.py  dedup.py  build_cpt_mix.py  build_sft_qa.py  quality_pl.py
+  common/         records.py  tool_catalog.py  tooling.py   (schema, tools, validation)
+  ingest/         sejm_isap.py  dane_gov.py  gus_bdl.py  culturax_pl.py  hplt_pl.py  replay_en.py
+  process/        pipeline.py  dedup.py  build_cpt_mix.py  build_sft_qa.py  build_dpo.py
+                  make_holdout.py  quality_pl.py
   train/          cpt.py  sft.py  dpo.py  export_gguf.py  _common.py
-  eval/           run_eval.py  catalog_eval.py  smoke_gguf.py
+  eval/           run_eval.py  catalog_eval.py  agentic_eval.py  smoke_gguf.py
+tests/            unit tests for the pure-logic modules (pytest)
 data/
   raw/            downloaded corpora (gitignored)
   interim/        clean/  dedup/  (gitignored)
   processed/      cpt/  sft/  dpo/  (gitignored)
-  catalogs/       ISAP  dane.gov.pl  GUS BDL  (gitignored)
+  catalogs/       ISAP  dane.gov.pl  GUS BDL  (+ _holdout/ for eval)  (gitignored)
 models/           adapters  merged  gguf  (gitignored)
 eval/results/     benchmark scores  (gitignored)
 docs/             SETUP.md
 plans/            implementation plan
+Makefile          per-stage entrypoints        pyproject.toml   ruff/black/pytest config
+.github/workflows/ci.yml   lint + tests on push/PR
 ```
 
 ## Troubleshooting
@@ -657,8 +787,10 @@ plans/            implementation plan
 | `check_env.py` bf16 test fails | PyTorch lacks `sm_120` kernels — reinstall from `cu128` index |
 | `Unsloth unavailable` in training log | Unsloth may not support your architecture; PEFT fallback is used automatically — no action needed |
 | OOM during CPT | Reduce `per_device_train_batch_size` to 1, double `gradient_accumulation_steps` |
-| `target_modules not found` PEFT error | Set `target_modules: auto` in the config, or run `print([n for n,_ in model.named_modules()])` and set an explicit list |
+| `target_modules: auto detected no known projection modules` | Auto-detection found nothing and raised (listing candidate module names) — set `lora.target_modules` explicitly from a `configs/models/` preset |
 | GGUF smoke test produces garbled text | Chat template mismatch — ensure `<\|im_start\|>` tokens are in the GGUF's tokenizer |
+| GGUF export behaves like the base model | You didn't merge — run the final stage with `--merge` first; export reads `<output_dir>/merged` (or pass `--model-dir`) |
 | lm-eval task not found | Run `lm-eval --tasks list \| grep -i pl` to get current Polish task IDs |
 | English scores drop >3% after CPT | Increase `replay_fraction` in `build_cpt_mix.py` (try 0.22), rebuild CPT mix, restart CPT |
 | DPO loss spikes or diverges | LR is too high — halve `learning_rate` in `configs/dpo.yaml` and restart from SFT merged |
+| `--backend vllm` with `--peft` | Not supported — vllm cannot load PEFT adapters; use a merged model with `--model` |

@@ -28,22 +28,11 @@ from pathlib import Path
 import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from common.records import JsonlWriter, Record, get_json, today_iso  # noqa: E402
+from common.records import (  # noqa: E402
+    JsonlWriter, Record, get_json, today_iso, is_commercial_safe, normalize_license,
+)
 
 API = "https://api.dane.gov.pl/1.4/datasets"
-
-COMMERCIAL_SAFE = {"cc0", "cc-by", "cc-by-4.0", "cc-by-3.0", "public-domain", "pddl"}
-
-
-def normalize_license(raw) -> str:
-    if not raw:
-        return "unknown"
-    r = str(raw).strip().lower().replace(" ", "-")
-    return r
-
-
-def is_commercial_safe(lic: str) -> bool:
-    return any(lic.startswith(ok) for ok in COMMERCIAL_SAFE)
 
 
 def harvest(out: str, max_pages: int, per_page: int, commercial_safe: bool) -> int:

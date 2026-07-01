@@ -5,7 +5,7 @@
 # or see configs/models/ for per-architecture presets.
 
 base_model: Qwen/Qwen3.6-27B
-max_lentg: 4096          # safe default; 96 GB allows ~8192 — raise after a pilot
+max_seq_len: 4096          # safe default; 96 GB allows ~8192 — raise after a pilot
 load_in_4bit: true         # NF4; or NVFP4 if bitsandbytes gains Blackwell support
 # auto = freeze if vision parameters detected; skip silently for pure LLMs.
 # true = always freeze. false = never freeze.
@@ -27,7 +27,7 @@ lora:
 # Data: packed parquet produced by scripts/process/build_cpt_mix.py
 train_files: data/processed/cpt/train/*.parquet
 eval_files: data/processed/cpt/val/*.parquet
-replay_fraction: 0.18      # 15-20% EN replay — critical given no base model
+replay_fraction: 0.18      # consumed by scripts/process/build_cpt_mix.py (--replay-fraction), not the trainer; kept here as the canonical value
 
 # Packing: enabled for CPT efficiency (~8x fewer steps than packing=false).
 # flash-linear-attention + causal-conv1d are installed so SSM layers use fast kernels.
@@ -49,7 +49,10 @@ output_dir: models/cpt
 save_steps: 500
 eval_steps: 2000
 logging_steps: 20
-english_retention_check: true   # run small EN benchmark every eval step
+# english_retention_check: run a small EN benchmark during CPT to detect catastrophic
+# forgetting. NOT yet wired into cpt.py — retention is currently measured out-of-band via
+# scripts/eval/run_eval.py --suite english. Left commented until implemented.
+# english_retention_check: true
 
 seed: 3407
 

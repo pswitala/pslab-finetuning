@@ -17,6 +17,36 @@ from typing import Iterable, Iterator
 import requests
 
 
+# Canonical commercial-safe (permissive / open) license prefixes, matched via
+# str.startswith on a normalized (lowercased, spaces->hyphens) license string.
+# This is the SINGLE source of truth — ingest and processing stages import it so the
+# commercial-safe filter never drifts between them.
+COMMERCIAL_SAFE_PREFIXES = (
+    "cc0", "cc-by", "public-domain", "pddl", "odc-by", "apache", "mit",
+)
+
+
+def normalize_license(raw) -> str:
+    """Lowercase + collapse spaces to hyphens; empty/None -> 'unknown'."""
+    if not raw:
+        return "unknown"
+    return str(raw).strip().lower().replace(" ", "-")
+
+
+def is_commercial_safe(license_str) -> bool:
+    """True only for permissive licenses safe for commercial fine-tuning.
+
+    Excludes NonCommercial (-nc) and NoDerivatives (-nd) variants even when they
+    start with an allowed prefix (e.g. "cc-by-nc-4.0" is NOT commercial-safe).
+    """
+    lic = normalize_license(license_str)
+    if lic == "unknown":
+        return False
+    if "-nc" in lic or "-nd" in lic:      # NonCommercial / NoDerivatives
+        return False
+    return lic.startswith(COMMERCIAL_SAFE_PREFIXES)
+
+
 @dataclass
 class Record:
     """One ingested document with provenance."""

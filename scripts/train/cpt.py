@@ -19,7 +19,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import load_config, load_model_and_tokenizer, load_for_merge, merge_and_save  # noqa: E402
+from _common import (  # noqa: E402
+    load_config, load_model_and_tokenizer, load_for_merge, merge_and_save, wandb_report_to,
+)
 
 
 def load_text_dataset(files_glob: str):
@@ -79,7 +81,7 @@ def main() -> int:
         eval_steps=cfg.get("eval_steps", 500) if eval_ds else None,
         eval_strategy="steps" if eval_ds else "no",
         seed=cfg.get("seed", 3407),
-        report_to=["wandb"] if _wandb_enabled() else [],
+        report_to=wandb_report_to(),
     )
     trainer = SFTTrainer(
         model=loaded.model,
@@ -92,11 +94,6 @@ def main() -> int:
     trainer.save_model(cfg["output_dir"])
     print(f"[cpt] done -> {cfg['output_dir']} (run with --merge to produce merged/)")
     return 0
-
-
-def _wandb_enabled() -> bool:
-    import os
-    return bool(os.environ.get("WANDB_API_KEY"))
 
 
 if __name__ == "__main__":
