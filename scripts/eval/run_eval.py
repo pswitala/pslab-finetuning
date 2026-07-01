@@ -18,6 +18,9 @@ Usage:
     # After full pipeline, evaluate merged model (save it to Linux fs first):
     python scripts/eval/run_eval.py --model models/dpo/merged --suite polish
     python scripts/eval/run_eval.py --model Qwen/Qwen3.6-27B --suite english   # baseline
+
+    # vllm backend (higher throughput, merged model only — incompatible with --peft):
+    python scripts/eval/run_eval.py --model models/dpo/merged --suite polish --backend vllm
 """
 
 from __future__ import annotations
@@ -60,11 +63,16 @@ def main() -> int:
     ap.add_argument("--out", default="eval/results")
     ap.add_argument("--batch-size", default="auto")
     ap.add_argument("--limit", type=int, default=0, help="0 = full; >0 = quick subset")
+    ap.add_argument("--backend", choices=["hf", "vllm"], default="hf",
+                    help="lm-eval inference backend: hf (default) or vllm")
     args = ap.parse_args()
 
     tasks = ",".join(TASKS[args.suite])
     out_dir = Path(args.out) / args.suite
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.backend == "vllm" and args.peft:
+        ap.error("--backend vllm is incompatible with --peft; use a merged model with --model")
 
     if args.peft:
         # Derive base model from adapter_config.json if not explicitly provided
@@ -80,13 +88,24 @@ def main() -> int:
     else:
         model_args = f"pretrained={args.model},dtype=bfloat16"
 
-    cmd = [
-        "lm-eval", "--model", "hf",
-        "--model_args", model_args,
-        "--tasks", tasks,
-        "--batch_size", str(args.batch_size),
-        "--output_path", str(out_dir),
-    ]
+    if args.backend == "vllm":
+        # tensor_parallel_size=1 prevents vllm from attempting multi-GPU sharding
+        vllm_args = f"pretrained={args.model},dtype=bfloat16,tensor_parallel_size=1"
+        cmd = [
+            "lm-eval", "--model", "vllm",
+            "--model_args", vllm_args,
+            "--tasks", tasks,
+            "--batch_size", str(args.batch_size),
+            "--output_path", str(out_dir),
+        ]
+    else:
+        cmd = [
+            "lm-eval", "--model", "hf",
+            "--model_args", model_args,
+            "--tasks", tasks,
+            "--batch_size", str(args.batch_size),
+            "--output_path", str(out_dir),
+        ]
     if args.limit:
         cmd += ["--limit", str(args.limit)]
 

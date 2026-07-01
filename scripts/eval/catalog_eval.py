@@ -16,6 +16,14 @@ Build a held-out set first (questions derived from records, with reference answe
 Then evaluate:
     python scripts/eval/catalog_eval.py --model models/dpo/merged \
         --qa eval/data/catalog_qa_holdout.jsonl --out eval/results/catalog
+
+    # vllm backend (batches all prompts at once — faster throughput):
+    python scripts/eval/catalog_eval.py --model models/dpo/merged \
+        --qa eval/data/catalog_qa_holdout.jsonl --backend vllm
+
+    # GGUF backend (--model is the .gguf file path):
+    python scripts/eval/catalog_eval.py --model models/gguf/model-Q4_K_M.gguf \
+        --qa eval/data/catalog_qa_holdout.jsonl --backend gguf
 """
 
 from __future__ import annotations
@@ -53,22 +61,24 @@ def load_qa(path: str) -> list[dict]:
     return items
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--model", required=True)
-    ap.add_argument("--qa", required=True)
-    ap.add_argument("--out", default="eval/results/catalog")
-    ap.add_argument("--max-new-tokens", type=int, default=256)
-    ap.add_argument("--threshold", type=float, default=0.5,
-                    help="overlap >= threshold counts as recalled")
-    args = ap.parse_args()
+def _apply_chat_template(tok, question: str) -> str:
+    try:
+        return tok.apply_chat_template(
+            [{"role": "user", "content": question}],
+            tokenize=False, add_generation_prompt=True,
+            enable_thinking=False)
+    except TypeError:
+        return tok.apply_chat_template(
+            [{"role": "user", "content": question}],
+            tokenize=False, add_generation_prompt=True)
 
+
+def _infer_hf(args, qa: list[dict]) -> list[str]:
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
 
-    # Try CausalLM first; VLMs fall back to Vision2Seq.
     try:
         model = AutoModelForCausalLM.from_pretrained(
             args.model, torch_dtype=torch.bfloat16, device_map="auto",
@@ -80,34 +90,99 @@ def main() -> int:
             trust_remote_code=True)
     model.eval()
 
-    qa = load_qa(args.qa)
-    results, hits, total_overlap = [], 0, 0.0
+    answers = []
     for ex in qa:
-        # Disable thinking mode for clean closed-book answers.
-        try:
-            prompt = tok.apply_chat_template(
-                [{"role": "user", "content": ex["q"]}],
-                tokenize=False, add_generation_prompt=True,
-                enable_thinking=False)
-        except TypeError:
-            prompt = tok.apply_chat_template(
-                [{"role": "user", "content": ex["q"]}],
-                tokenize=False, add_generation_prompt=True)
+        prompt = _apply_chat_template(tok, ex["q"])
         ids = tok(prompt, return_tensors="pt").to(model.device)
         with torch.no_grad():
             gen = model.generate(**ids, max_new_tokens=args.max_new_tokens,
                                  do_sample=False)
         answer = tok.decode(gen[0][ids["input_ids"].shape[1]:],
                             skip_special_tokens=True).strip()
+        answers.append(answer)
+    return answers
+
+
+def _infer_vllm(args, qa: list[dict]) -> list[str]:
+    from vllm import LLM, SamplingParams
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    llm = LLM(
+        model=args.model,
+        dtype="bfloat16",
+        trust_remote_code=True,
+        max_model_len=4096,
+    )
+    params = SamplingParams(max_tokens=args.max_new_tokens, temperature=0.0)
+
+    prompts = [_apply_chat_template(tok, ex["q"]) for ex in qa]
+    outputs = llm.generate(prompts, params)
+    return [o.outputs[0].text.strip() for o in outputs]
+
+
+def _infer_gguf(args, qa: list[dict]) -> list[str]:
+    try:
+        from llama_cpp import Llama
+    except ImportError as exc:
+        raise SystemExit(
+            f"[catalog_eval] llama-cpp-python not available: {exc}\n"
+            "Install with GPU support: CMAKE_ARGS='-DGGML_CUDA=on' pip install llama-cpp-python"
+        ) from exc
+
+    llm = Llama(model_path=args.model, n_ctx=4096, n_gpu_layers=-1, verbose=False)
+    answers = []
+    for ex in qa:
+        out = llm.create_chat_completion(
+            messages=[{"role": "user", "content": ex["q"]}],
+            max_tokens=args.max_new_tokens,
+            temperature=0.0,
+        )
+        answers.append(out["choices"][0]["message"]["content"].strip())
+    return answers
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", required=True,
+                    help="HF model path/id, or .gguf file path when --backend gguf")
+    ap.add_argument("--qa", required=True)
+    ap.add_argument("--out", default="eval/results/catalog")
+    ap.add_argument("--max-new-tokens", type=int, default=256)
+    ap.add_argument("--threshold", type=float, default=0.5,
+                    help="overlap >= threshold counts as recalled")
+    ap.add_argument("--backend", choices=["hf", "vllm", "gguf"], default="hf",
+                    help="Inference backend: hf (default), vllm, or gguf")
+    args = ap.parse_args()
+
+    qa = load_qa(args.qa)
+    if not qa:
+        print("[catalog_eval] no QA items found; check --qa path")
+        return 1
+
+    if args.backend == "hf":
+        answers = _infer_hf(args, qa)
+    elif args.backend == "vllm":
+        answers = _infer_vllm(args, qa)
+    else:
+        answers = _infer_gguf(args, qa)
+
+    results, hits, total_overlap = [], 0, 0.0
+    for ex, answer in zip(qa, answers):
         sc = overlap_score(answer, ex["ref"])
         hits += sc >= args.threshold
         total_overlap += sc
         results.append({"q": ex["q"], "ref": ex["ref"], "answer": answer, "score": sc})
 
     n = len(qa)
-    summary = {"n": n, "recall_rate": hits / n if n else 0.0,
-               "mean_overlap": total_overlap / n if n else 0.0,
-               "model": args.model, "threshold": args.threshold}
+    summary = {
+        "n": n,
+        "recall_rate": hits / n if n else 0.0,
+        "mean_overlap": total_overlap / n if n else 0.0,
+        "model": args.model,
+        "backend": args.backend,
+        "threshold": args.threshold,
+    }
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2))
