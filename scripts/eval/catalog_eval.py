@@ -6,7 +6,7 @@ retrieval. Build the question set from held-out catalog records (kept out of tra
 then score the model's free-text answers against reference facts.
 
 Scoring: lightweight string/number-overlap by default; plug an LLM judge for nuance.
-Compare the fine-tuned model against the base Qwen3.6-27B (which should be near-zero on
+Compare the fine-tuned model against the base model (which should be near-zero on
 Polish-specific public data).
 
 Build a held-out set first (questions derived from records, with reference answers):
@@ -68,8 +68,7 @@ def main() -> int:
 
     tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
 
-    # Qwen3.6-27B is Qwen3_5ForConditionalGeneration (VLM). AutoModelForCausalLM
-    # works for text-only generation via its generate() interface.
+    # Try CausalLM first; VLMs fall back to Vision2Seq.
     try:
         model = AutoModelForCausalLM.from_pretrained(
             args.model, torch_dtype=torch.bfloat16, device_map="auto",

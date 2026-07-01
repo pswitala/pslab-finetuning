@@ -1,15 +1,14 @@
 """Shared helpers for the QLoRA training scripts (CPT / SFT / DPO).
 
-Architecture facts for Qwen3.6-27B (verified 2026-06):
-- Model type: qwen3_5  (Qwen3_5ForConditionalGeneration) — a VLM.
-- Hybrid: 16 × (3× Gated DeltaNet + 1× Gated Attention) = 64 layers.
-- 75% of layers are SSM/linear-attention (linear_attn.*).
-- Vision encoder is present but frozen for text-only fine-tuning.
-- No base checkpoint — only instruct. Thinking mode disabled via chat template.
+Supports any HuggingFace causal-LM or VLM via PEFT. Tries Unsloth first;
+falls back to PEFT + bitsandbytes automatically.
 
-Unsloth note: FastQwen3_5Model is NOT confirmed in Unsloth as of 2026-06 planning.
-_load_peft_fallback is the expected primary path unless Unsloth adds support.
-Check `unsloth --version` release notes before assuming the Unsloth path works.
+Config keys consumed here:
+  base_model            — HF model ID or local path
+  lora.target_modules   — projection name list, or "auto" for auto-detection
+  freeze_vision_encoder — "auto" | true | false  (default: "auto")
+  load_in_4bit          — NF4 quantization
+  bf16, gradient_checkpointing
 """
 
 from __future__ import annotations
@@ -26,6 +25,60 @@ def load_config(path: str) -> dict[str, Any]:
         return yaml.safe_load(fh)
 
 
+_ATTN_PATTERNS = [
+    ["q_proj", "k_proj", "v_proj", "o_proj"],   # Llama, Mistral, Qwen attn, Gemma
+    ["c_attn", "c_proj"],                         # GPT-2 / GPT-NeoX (fused QKV)
+    ["to_q", "to_k", "to_v", "to_out"],           # Diffusers / DiT
+    ["query", "key", "value", "dense"],            # BERT / RoBERTa
+    ["query_key_value", "dense"],                  # Falcon / older MPT
+]
+_MLP_PATTERNS = [
+    ["gate_proj", "up_proj", "down_proj"],         # Llama / Mistral / Qwen MLP
+    ["fc1", "fc2"],                                # GPT-2 / BERT MLP
+    ["w1", "w2", "w3"],                            # some custom architectures
+]
+_SSM_CANDIDATES = [
+    "in_proj_qkv", "out_proj", "in_proj_z", "in_proj_a", "in_proj_b",
+    "in_proj", "x_proj", "dt_proj",               # Mamba / Qwen SSM
+]
+
+
+def _resolve_target_modules(model: Any, cfg_modules: Any) -> list[str] | Any:
+    """Return resolved LoRA target_modules list.
+
+    "auto" → inspect model.named_modules() for common projection patterns.
+    list   → returned unchanged (user override).
+    Falls back to ["q_proj", "v_proj"] if nothing detected.
+    """
+    if cfg_modules != "auto":
+        return cfg_modules
+    names = {n.split(".")[-1] for n, _ in model.named_modules()}
+    detected: list[str] = []
+    for pat in _ATTN_PATTERNS:
+        hits = [p for p in pat if p in names]
+        if hits:
+            detected.extend(hits)
+            break
+    for pat in _MLP_PATTERNS:
+        hits = [p for p in pat if p in names]
+        if hits:
+            detected.extend(hits)
+            break
+    detected.extend(p for p in _SSM_CANDIDATES if p in names)
+    seen: set[str] = set()
+    unique: list[str] = []
+    for x in detected:
+        if x not in seen:
+            seen.add(x)
+            unique.append(x)
+    if unique:
+        print(f"[_common] auto-detected target_modules: {unique}")
+        return unique
+    print("[_common] WARNING: auto-detection found nothing; falling back to ['q_proj','v_proj']. "
+          "Set lora.target_modules explicitly.")
+    return ["q_proj", "v_proj"]
+
+
 @dataclass
 class LoadedModel:
     model: Any
@@ -34,11 +87,10 @@ class LoadedModel:
 
 
 def load_model_and_tokenizer(cfg: dict) -> LoadedModel:
-    """Load Qwen3.6-27B + attach QLoRA adapter.
+    """Load model + attach QLoRA adapter.
 
-    Tries Unsloth first (fast kernels). Falls back to PEFT if Unsloth doesn't yet
-    support the qwen3_5 architecture — which is expected to be the common case
-    until Unsloth ships a Qwen3.6 release.
+    Tries Unsloth first (fast kernels); falls back to PEFT + bitsandbytes
+    if Unsloth does not support this architecture.
     """
     try:
         from unsloth import FastLanguageModel
@@ -50,33 +102,37 @@ def load_model_and_tokenizer(cfg: dict) -> LoadedModel:
             load_in_4bit=cfg.get("load_in_4bit", True),
             dtype=torch.bfloat16 if cfg.get("bf16", True) else None,
         )
+        target_modules = _resolve_target_modules(model, lora["target_modules"])
         model = FastLanguageModel.get_peft_model(
             model,
             r=lora["r"],
             lora_alpha=lora["alpha"],
             lora_dropout=lora.get("dropout", 0.0),
-            target_modules=lora["target_modules"],
+            target_modules=target_modules,
             use_rslora=lora.get("use_rslora", False),
             use_dora=lora.get("use_dora", False),
             use_gradient_checkpointing="unsloth" if cfg.get("gradient_checkpointing", True) else False,
             random_state=cfg.get("seed", 3407),
         )
-        _freeze_vision_encoder(model)
+        _maybe_freeze_vision_encoder(model, cfg)
         return LoadedModel(model, tokenizer, "unsloth")
     except Exception as exc:  # noqa: BLE001
         print(f"[_common] Unsloth unavailable for this model ({exc}); using PEFT fallback.")
         return _load_peft_fallback(cfg)
 
 
-def _load_peft_fallback(cfg: dict) -> LoadedModel:
-    """PEFT path — primary path for Qwen3.6-27B until Unsloth adds qwen3_5 support.
+_MODEL_LOADERS = [
+    "AutoModelForCausalLM",
+    "AutoModelForSeq2SeqLM",
+    "AutoModelForVision2Seq",
+]
 
-    Qwen3_5ForConditionalGeneration is a VLM. We load it with AutoModelForCausalLM
-    (works for text generation since the class supports it), then freeze the vision
-    encoder so only text layers receive gradients.
-    """
+
+def _load_peft_fallback(cfg: dict) -> LoadedModel:
+    """PEFT path — used when Unsloth is unavailable or does not support this architecture."""
+    import importlib
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from transformers import AutoTokenizer, BitsAndBytesConfig
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
     lora = cfg["lora"]
@@ -91,38 +147,42 @@ def _load_peft_fallback(cfg: dict) -> LoadedModel:
 
     tokenizer = AutoTokenizer.from_pretrained(cfg["base_model"], trust_remote_code=True)
 
-    # AutoModelForCausalLM works for text generation with Qwen VLMs.
-    # If it fails for this model type, fall back to the explicit class.
-    try:
-        model = AutoModelForCausalLM.from_pretrained(
-            cfg["base_model"],
-            quantization_config=quant,
-            dtype=torch.bfloat16,
-            device_map="auto",
-            trust_remote_code=True,
-        )
-    except Exception:  # noqa: BLE001
-        from transformers import AutoModelForVision2Seq
-        model = AutoModelForVision2Seq.from_pretrained(
-            cfg["base_model"],
-            quantization_config=quant,
-            dtype=torch.bfloat16,
-            device_map="auto",
-            trust_remote_code=True,
-        )
+    load_kwargs = dict(
+        quantization_config=quant,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+    model = None
+    last_exc = None
+    for cls_name in _MODEL_LOADERS:
+        try:
+            cls = getattr(importlib.import_module("transformers"), cls_name)
+            model = cls.from_pretrained(cfg["base_model"], **load_kwargs)
+            print(f"[_common] loaded with {cls_name}")
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            print(f"[_common] {cls_name} failed ({exc.__class__.__name__}); trying next...")
+    if model is None:
+        raise RuntimeError(
+            f"Could not load {cfg['base_model']} with any Auto class. "
+            f"Last error: {last_exc}"
+        ) from last_exc
 
-    _freeze_vision_encoder(model)
+    _maybe_freeze_vision_encoder(model, cfg)
 
     if quant is not None:
         model = prepare_model_for_kbit_training(
             model, use_gradient_checkpointing=cfg.get("gradient_checkpointing", True))
 
     # PEFT task_type: CAUSAL_LM works for text generation models including VLMs.
+    target_modules = _resolve_target_modules(model, lora["target_modules"])
     peft_cfg = LoraConfig(
         r=lora["r"],
         lora_alpha=lora["alpha"],
         lora_dropout=lora.get("dropout", 0.0),
-        target_modules=lora["target_modules"],
+        target_modules=target_modules,
         bias="none",
         task_type="CAUSAL_LM",
         use_rslora=lora.get("use_rslora", False),
@@ -133,15 +193,29 @@ def _load_peft_fallback(cfg: dict) -> LoadedModel:
     return LoadedModel(model, tokenizer, "peft")
 
 
-def _freeze_vision_encoder(model: Any) -> None:
-    """Freeze all vision encoder parameters — text-only fine-tuning."""
+def _maybe_freeze_vision_encoder(model: Any, cfg: dict) -> None:
+    """Freeze vision encoder if present, controlled by cfg["freeze_vision_encoder"].
+
+    "auto" (default) — freeze only if vision-prefixed params are found.
+    True             — always freeze (use if auto misses your VLM's naming).
+    False            — skip entirely (pure LMs, avoids log noise).
+    """
+    mode = cfg.get("freeze_vision_encoder", "auto")
+    if mode is False or mode == "false":
+        return
     frozen = 0
+    found = False
     for name, param in model.named_parameters():
         if _is_vision_param(name):
+            found = True
             param.requires_grad_(False)
             frozen += 1
+    if mode == "auto" and not found:
+        return  # pure LM — silent
     if frozen:
         print(f"[_common] frozen {frozen} vision encoder parameters")
+    elif mode is True or mode == "true":
+        print("[_common] WARNING: freeze_vision_encoder=true but no vision params found.")
 
 
 def _is_vision_param(name: str) -> bool:
@@ -151,7 +225,7 @@ def _is_vision_param(name: str) -> bool:
 
 
 def load_for_merge(cfg: dict) -> LoadedModel:
-    """Load base model in bf16 + apply the TRAINED adapter from output_dir for merging.
+    """Load base model in bf16 + apply the trained adapter from output_dir for merging.
 
     Must be called instead of load_model_and_tokenizer when --merge is used.
     The base model is loaded in bf16 (not 4-bit) because merge_and_unload requires
@@ -165,11 +239,11 @@ def load_for_merge(cfg: dict) -> LoadedModel:
     tokenizer = AutoTokenizer.from_pretrained(cfg["base_model"], trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         cfg["base_model"],
-        dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16,
         device_map="auto",
         trust_remote_code=True,
     )
-    _freeze_vision_encoder(model)
+    _maybe_freeze_vision_encoder(model, cfg)
     model = PeftModel.from_pretrained(model, adapter_dir)
     print(f"[_common] loaded trained adapter from {adapter_dir}")
     return LoadedModel(model, tokenizer, "peft")

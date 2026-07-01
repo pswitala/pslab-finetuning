@@ -139,23 +139,24 @@ def main() -> int:
                          train_dataset=train_ds, eval_dataset=eval_ds, args=sft_cfg)
 
     # Train on responses only: mask prompt tokens in the loss.
-    # Qwen3.6 uses the standard ChatML format (<|im_start|>role\n ... <|im_end|>).
+    # Separator tokens are read from config (instruction_part / response_part).
     if cfg.get("train_on_responses_only", True) and loaded.backend == "unsloth":
+        instruction_part = cfg.get("instruction_part", "<|im_start|>user\n")
+        response_part = cfg.get("response_part", "<|im_start|>assistant\n")
         try:
             from unsloth.chat_templates import train_on_responses_only
             trainer = train_on_responses_only(
                 trainer,
-                instruction_part="<|im_start|>user\n",
-                response_part="<|im_start|>assistant\n",
+                instruction_part=instruction_part,
+                response_part=response_part,
             )
         except Exception as exc:  # noqa: BLE001
             print(f"[sft] train_on_responses_only (Unsloth) skipped: {exc}")
             # PEFT fallback: TRL DataCollatorForCompletionOnlyLM handles masking.
             try:
                 from trl import DataCollatorForCompletionOnlyLM
-                response_template = "<|im_start|>assistant\n"
                 collator = DataCollatorForCompletionOnlyLM(
-                    response_template, tokenizer=loaded.tokenizer)
+                    response_part, tokenizer=loaded.tokenizer)
                 trainer.data_collator = collator
             except Exception as exc2:  # noqa: BLE001
                 print(f"[sft] DataCollatorForCompletionOnlyLM also skipped: {exc2}")
@@ -167,9 +168,8 @@ def main() -> int:
 
 
 def _maybe_set_chat_template(loaded, cfg) -> None:
-    # Qwen3.6-27B ships with its own chat_template.jinja — use it as-is.
-    # We no longer override with Unsloth's "qwen3" template since the model's
-    # own template handles thinking mode correctly via enable_thinking kwarg.
+    # Use the model's built-in chat_template as-is.
+    # Override by setting tokenizer.chat_template directly if needed.
     pass
 
 

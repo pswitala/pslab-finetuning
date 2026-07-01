@@ -1,53 +1,28 @@
 # Continued Pretraining (CPT) config — QLoRA via Unsloth (or TRL+PEFT fallback).
 #
-# === CRITICAL ARCHITECTURE NOTES (verified 2026-06) ===
-# Model:  Qwen/Qwen3.6-27B  (Apache 2.0, 27B dense, 64 layers, 262K ctx)
-# Arch:   SSM-HYBRID — 16 × (3× Gated DeltaNet + 1× Gated Attention)
-#         75% of layers are linear/SSM attention (linear_attn.*), only 25% are
-#         standard attention (self_attn.*). Must target BOTH in LoRA.
-# VLM:    Qwen3_5ForConditionalGeneration — has vision encoder. It is frozen
-#         automatically in _common.py; only text layers are trained.
-# Base:   NO BASE checkpoint published — only instruct. CPT starts from the
-#         instruct model. Use a LOWER LR (3e-5 not 1e-4) and keep EN replay
-#         high to avoid undoing alignment.
-# Think:  Model generates <think> tokens by default. For raw-text CPT this is
-#         irrelevant (no chat template applied), but SFT/DPO must disable it.
-# Unsloth: FastQwen3_5Model / Qwen3.6 support is NOT confirmed in Unsloth as of
-#         planning time. _common.py will fall back to TRL+PEFT automatically.
+# Set base_model to any HF model ID or local path.
+# Set lora.target_modules: auto for automatic projection detection,
+# or see configs/models/ for per-architecture presets.
 
 base_model: Qwen/Qwen3.6-27B
 max_lentg: 4096          # safe default; 96 GB allows ~8192 — raise after a pilot
 load_in_4bit: true         # NF4; or NVFP4 if bitsandbytes gains Blackwell support
+# auto = freeze if vision parameters detected; skip silently for pure LLMs.
+# true = always freeze. false = never freeze.
+freeze_vision_encoder: auto
 
-# LoRA — covers both attention types + MLP.
-# Full-attention layers  (every 4th): self_attn.{q,k,v,o}_proj
-# Linear-attention/SSM   (other 3/4): linear_attn.{in_proj_qkv, in_proj_z,
-#                                      in_proj_a, in_proj_b, out_proj}
-# MLP (all layers): mlp.{gate,up,down}_proj
 lora:
   r: 64
   alpha: 128
   dropout: 0.05
   use_rslora: true
   use_dora: false
-  target_modules:
-    # Standard attention (16 layers)
-    - q_proj
-    - k_proj
-    - v_proj
-    - o_proj
-    # SSM / linear-attention projections (48 layers — do NOT skip these)
-    - in_proj_qkv
-    - out_proj
-    - in_proj_z
-    # The next two touch SSM state-space internals — included for deeper adaptation;
-    # remove them for a more conservative run.
-    - in_proj_a
-    - in_proj_b
-    # MLP (all 64 layers)
-    - gate_proj
-    - up_proj
-    - down_proj
+  # "auto" inspects the loaded model and detects common projection names.
+  # Override with an explicit list for uncommon architectures (see configs/models/).
+  # Qwen3.6-27B SSM preset:  q_proj k_proj v_proj o_proj in_proj_qkv out_proj
+  #                           in_proj_z in_proj_a in_proj_b gate_proj up_proj down_proj
+  # Llama-3 / Mistral preset: q_proj k_proj v_proj o_proj gate_proj up_proj down_proj
+  target_modules: auto
 
 # Data: packed parquet produced by scripts/process/build_cpt_mix.py
 train_files: data/processed/cpt/train/*.parquet

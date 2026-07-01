@@ -1,14 +1,15 @@
-# Qwen3.6-27B → Polish
+# Polish LLM Fine-Tuning Pipeline
 
-Fine-tune **Qwen3.6-27B** for the Polish context: native fluency, cultural
-grounding, and factual knowledge from Polish open-data catalogs baked into the
-weights. Final artifact: **GGUF** files runnable in llama.cpp / Ollama.
+End-to-end QLoRA fine-tuning pipeline targeting Polish language fluency and factual
+knowledge from Polish open-data catalogs baked into model weights. Final artifact:
+**GGUF** files runnable in llama.cpp / Ollama.
+
+**Default model:** Qwen3.6-27B (SSM-hybrid VLM, 96 GB VRAM target). Set `BASE_MODEL`
+in `.env` to any HuggingFace model ID — the pipeline auto-detects LoRA target layers
+and freezes vision encoders only when present. See `configs/models/` for per-architecture
+presets (Llama-3, Phi-3, Mistral).
 
 **Hardware:** 1× NVIDIA RTX 6000 Pro Blackwell, 96 GB VRAM (single GPU, QLoRA).
-
-**Architecture note:** Qwen3.6-27B is an SSM-hybrid VLM (`Qwen3_5ForConditionalGeneration`):
-64 layers = 16 × (3× Gated DeltaNet + 1× Gated Attention). Only an instruct
-checkpoint exists — no base. Vision encoder is frozen automatically during training.
 
 ---
 
@@ -16,26 +17,39 @@ checkpoint exists — no base. Vision encoder is frozen automatically during tra
 
 ### Step 0 — Install the environment
 
-**What it does:** Prepares the Python environment with training-specific packages on top of the existing `vllm` virtualenv, which already ships with a Blackwell-compatible torch and inference stack.
+**What it does:** Creates a clean Python virtual environment and installs the full pinned
+dependency stack from `requirements.txt`, including PyTorch 2.10 with Blackwell (sm_120)
+CUDA kernels, FlashInfer, vllm, peft, trl, and all corpus tooling.
 
-**Why this approach:** The vllm venv already has `torch==2.10.0` built against CUDA 12.9 with `sm_120` (Blackwell) kernels and `flashinfer-python==0.6.6` as the attention backend. Starting from scratch would mean rebuilding or downloading a large CUDA-enabled torch wheel unnecessarily. We only add what the training pipeline needs: `peft`, `trl`, `accelerate`, `bitsandbytes`, and the corpus tooling.
+**Why two custom wheel indices:** Two packages are not on the default PyPI index.
+`torch==2.10.0` with CUDA 12.8 / sm_120 (Blackwell) support lives on the PyTorch wheel
+server. `flashinfer-python==0.6.6` with Blackwell kernels lives on the FlashInfer wheel
+server. Passing both as `--extra-index-url` lets pip resolve them alongside the rest of
+the packages from PyPI in a single pass.
 
-**Why not flash-attn:** `flashinfer` is the Blackwell-compatible replacement for Flash Attention. The `flash-attn` package does not support `sm_120` as of planning time and conflicts with flashinfer if both are installed.
+**Why not flash-attn:** `flashinfer-python==0.6.6` is the Blackwell-compatible attention
+backend. `flash-attn` does not support `sm_120` and conflicts with flashinfer if both are
+installed — do not install it.
 
-**Why bitsandbytes for quantization:** bitsandbytes is the standard 4-bit NF4 training backend. Alternatives like GPTQ and AWQ produce inference-only quantized weights — you cannot attach trainable LoRA adapters on top of them. Only bitsandbytes keeps the quantized base frozen while training full-precision LoRA adapters alongside it.
+**Why bitsandbytes for quantization:** bitsandbytes is the standard 4-bit NF4 training
+backend. Alternatives like GPTQ and AWQ produce inference-only quantized weights — you
+cannot attach trainable LoRA adapters on top of them. Only bitsandbytes keeps the
+quantized base frozen while training full-precision LoRA adapters alongside it.
 
 ```bash
-# 1. Activate the vllm venv (adjust path to match your installation)
-source /path/to/vllm-venv/bin/activate
+# 1. Create a Python 3.11+ virtual environment
+python3 -m venv .venv
+source .venv/bin/activate      # Linux / Git Bash on Windows
+# .venv\Scripts\activate       # Windows cmd / PowerShell
 
-# 2. torch is already installed — skip reinstalling it.
-#    Verify it sees the GPU:
-python3 -c "import torch; print(torch.version.cuda, torch.cuda.get_device_capability())"
-# expect: 12.9  (12, 0)
+# 2. Upgrade pip (older pip may fail to resolve nvidia-* packages)
+pip install --upgrade pip
 
-# 3. Install training packages that are missing from the vllm venv
-pip install -r requirements.txt
-# installs: peft trl accelerate bitsandbytes datasets pyarrow zstandard datatrove trafilatura lm-eval
+# 3. Install the full pinned environment
+#    --extra-index-url lets pip find torch (cu128) and flashinfer on their custom indices.
+pip install -r requirements.txt \
+    --extra-index-url https://download.pytorch.org/whl/cu128 \
+    --extra-index-url https://flashinfer.ai/whl/cu128/torch2.10/
 
 # 4. (Optional) Install llama.cpp for GGUF export fallback
 #    Only needed if Unsloth's built-in GGUF export is unavailable.
@@ -46,17 +60,13 @@ cmake --build llama.cpp/build --config Release -j$(nproc)
 # 5. Make scripts executable
 chmod +x scripts/check_env.py scripts/**/*.py
 
-# 6. Authenticate with Hugging Face (to pull Qwen3.6-27B)
+# 6. Authenticate with Hugging Face
 huggingface-cli login
 
 # 7. Copy and fill in .env
 cp .env.example .env
-# Edit .env: set HF_TOKEN, optionally WANDB_API_KEY
+# Edit .env: set HF_TOKEN, optionally WANDB_API_KEY and WANDB_PROJECT
 ```
-
-> **Note on flash-attn:** do **not** install `flash-attn` — `flashinfer-python==0.6.6`
-> is already present and is the correct Blackwell-compatible replacement. Installing
-> both will cause conflicts.
 
 Verify the GPU and stack before doing anything else:
 
@@ -393,13 +403,13 @@ Observed results from the CPT pilot run on this machine:
 
 **What it does:** Trains the model on raw Polish text (web corpora, Wikipedia, legal acts, GUS statistics) plus English replay using next-token prediction on packed sequences. Produces a Polish-fluent model that still follows instructions. This is the most compute-intensive stage.
 
-**Why start from the instruct checkpoint (not a base model):** Qwen3.6-27B has no publicly released base checkpoint — only the instruct model exists. This is unusual but works, with adjustments. Starting from instruct means the model already knows how to follow instructions; CPT risks eroding this if done carelessly.
+**Why start from the instruct checkpoint (Qwen default):** Qwen3.6-27B has no publicly released base checkpoint — only the instruct model exists. This is unusual but works, with adjustments. Starting from instruct means the model already knows how to follow instructions; CPT risks eroding this if done carelessly. (If your model has a base checkpoint, prefer it for CPT — use a standard LR of 1e-4 and reduce English replay accordingly.)
 
 **Why conservative learning rate (3e-5 vs. typical 1e-4):** A high LR in CPT on an instruct model causes alignment degradation — the model stops following instructions and generates coherent Polish prose but ignores user intent. 3e-5 gives enough gradient signal to adapt to Polish text distribution while keeping the instruction-following behavior mostly intact. The English replay also helps anchor the model to its original capabilities.
 
 **Why QLoRA (not full fine-tuning):** At 27B parameters and bf16 precision, the model alone occupies ~54 GB of VRAM. Full fine-tuning requires optimizer states (Adam: 2× model size) on top — well over 96 GB. QLoRA loads the base model in 4-bit NF4 (~14 GB), keeps frozen, and attaches trainable 16-bit LoRA adapters (~1-2 GB depending on rank). This fits comfortably within 96 GB while still adapting 27B parameters of representation capacity through the adapter layers.
 
-**Why LoRA must target both attention types (SSM and standard):** Qwen3.6-27B's 64 layers are 75% Gated DeltaNet SSM layers (`linear_attn.*`) and only 25% standard attention layers (`self_attn.*`). Targeting only `q_proj`/`k_proj`/`v_proj` (the standard attention approach from Llama-era LoRA recipes) leaves 48 of 64 layers completely frozen — effectively a 75% capacity reduction. The config targets both `self_attn.*` projections and `linear_attn.*` projections (`in_proj_qkv`, `out_proj`, `in_proj_z`, `in_proj_a`, `in_proj_b`).
+**Why `target_modules: auto`:** LoRA only updates the projection layers you name. For a pure-attention model (Llama, Mistral) the correct targets are `q_proj`, `k_proj`, `v_proj`, `o_proj`, and the MLP projections — leaving those out means the adapter can only influence 25–50% of the model's representation capacity. For SSM-hybrid models like Qwen3.6-27B, 75% of layers are linear-attention/SSM (`linear_attn.*`) with different projection names (`in_proj_qkv`, `in_proj_z`, `in_proj_a`, `in_proj_b`) — missing them effectively freezes 48 of 64 layers. `target_modules: auto` in the config inspects the loaded model's named modules and selects the right projections automatically. Override with an explicit list if auto-detection is wrong (see `configs/models/` for presets).
 
 **Why rsLoRA (`use_rslora: true`):** Standard LoRA scales the adapter output by `alpha/r`. At high rank (r=64), this scaling can cause gradient instability during the early warmup steps. rsLoRA replaces this with `alpha/sqrt(r)`, which remains stable across a wider range of ranks and makes it safe to use r=64 for CPT without careful per-run LR tuning.
 
@@ -430,7 +440,9 @@ python scripts/train/cpt.py --config configs/cpt.yaml --merge
 
 **Why train_on_responses_only=True:** In standard causal language modeling, loss is computed over all tokens including user turns. This is correct for CPT (where there is no distinction between "input" and "output") but wrong for SFT. Learning to predict user messages teaches the model the distribution of user questions, which doesn't help it answer them. Masking user turns to zero loss focuses all gradient signal on producing better assistant responses, which is what evaluation measures.
 
-**Why enable_thinking=False:** Qwen3.6-27B's chat template generates `<think>` tokens before answering by default. For SFT on Polish instructions, we want the model to answer directly without extended thinking chains in the training labels (the Dolci-Instruct and catalog Q&A datasets don't contain thinking traces). Training with thinking enabled would produce `<think>...</think>` blocks in labels that the model must learn to reproduce, which is not the target behavior.
+**Why configurable separator tokens:** The tokens that delimit user and assistant turns differ by model family. ChatML (`<|im_start|>user\n` / `<|im_start|>assistant\n`) is used by Qwen, Llama-3-Instruct, and Mistral v0.3+. Llama-2 uses `[INST]`/`[/INST]`; Phi-3 uses `<|user|>\n`/`<|assistant|>\n`. The `instruction_part` and `response_part` keys in `sft.yaml` expose these as config rather than hardcoding them. See the comments in `configs/sft.yaml` for common presets.
+
+**Why enable_thinking=False:** Qwen3.6-27B's chat template generates `<think>` tokens before answering by default. For SFT we want clean responses without thinking traces in the training labels (the Dolci-Instruct and catalog Q&A datasets don't contain thinking traces). `enable_thinking=False` is passed to `tokenizer.apply_chat_template()` with a `try/except TypeError` fallback — models whose tokenizer does not support this parameter (Llama, Mistral, Phi-3, etc.) silently ignore it.
 
 **Why lower LR than CPT (2e-4 but still higher than CPT's 3e-5):** SFT is a smaller distributional shift than CPT — the model's weights are already adapted to Polish and we're now teaching response format and style. 2e-4 is standard for LoRA SFT. The reason it can be higher than CPT's 3e-5 is that CPT was starting from an instruct model whose alignment we wanted to preserve; at SFT time the model is already Polish-fluent and we want the instruction following to update more aggressively.
 
@@ -449,7 +461,7 @@ python scripts/train/sft.py --config configs/sft.yaml --merge
 ```
 
 > To skip CPT and start directly from the base model (faster iteration),
-> edit `configs/sft.yaml` and set `base_model: Qwen/Qwen3.6-27B`.
+> edit `configs/sft.yaml` and set `base_model:` to any HF model ID or local path.
 
 ---
 
@@ -541,7 +553,7 @@ Results are written to `eval/results/`. Compare the fine-tuned model against
 | `Q6_K` | ~23 GB | Near-lossless; for quality-sensitive applications |
 | `Q8_0` | ~28 GB | Reference quality — used to verify quantization loss vs. f16 |
 
-**Why two export backends:** Unsloth has its own GGUF exporter that runs within the same Python session as training, which is faster and avoids a separate llama.cpp compile. However, as of planning time, Unsloth has not confirmed `FastQwen3_5Model` support for the SSM-hybrid architecture. The llama.cpp `convert_hf_to_gguf.py` approach always works regardless of architecture and is the safe fallback.
+**Why two export backends:** Unsloth has its own GGUF exporter that runs within the same Python session as training, which is faster and avoids a separate llama.cpp compile. However, Unsloth may not support every architecture. The llama.cpp `convert_hf_to_gguf.py` approach always works regardless of architecture and is the safe fallback.
 
 ```bash
 # Preferred: Unsloth one-call exporter (if Qwen3.6 support is available)
@@ -620,6 +632,7 @@ python scripts/eval/smoke_gguf.py   --gguf models/gguf/model-Q4_K_M.gguf
 
 ```
 configs/          cpt.yaml  sft.yaml  dpo.yaml
+  models/         qwen3_ssm.yaml  llama3.yaml  phi3.yaml  (LoRA presets)
 scripts/
   check_env.py
   ingest/         sejm_isap.py  dane_gov.py  gus_bdl.py  culturax_pl.py
@@ -642,9 +655,9 @@ plans/            implementation plan
 | Symptom | Fix |
 |---|---|
 | `check_env.py` bf16 test fails | PyTorch lacks `sm_120` kernels — reinstall from `cu128` index |
-| `Unsloth unavailable` in training log | Expected for Qwen3.6 (new arch); PEFT fallback is used automatically |
+| `Unsloth unavailable` in training log | Unsloth may not support your architecture; PEFT fallback is used automatically — no action needed |
 | OOM during CPT | Reduce `per_device_train_batch_size` to 1, double `gradient_accumulation_steps` |
-| `target_modules not found` PEFT error | Run model + `print([n for n,_ in model.named_modules()])` to check layer names |
+| `target_modules not found` PEFT error | Set `target_modules: auto` in the config, or run `print([n for n,_ in model.named_modules()])` and set an explicit list |
 | GGUF smoke test produces garbled text | Chat template mismatch — ensure `<\|im_start\|>` tokens are in the GGUF's tokenizer |
 | lm-eval task not found | Run `lm-eval --tasks list \| grep -i pl` to get current Polish task IDs |
 | English scores drop >3% after CPT | Increase `replay_fraction` in `build_cpt_mix.py` (try 0.22), rebuild CPT mix, restart CPT |

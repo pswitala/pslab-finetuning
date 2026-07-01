@@ -1,31 +1,24 @@
 # Preference Optimization (DPO) config — QLoRA via Unsloth + TRL DPOTrainer.
 # Starts from the merged SFT checkpoint.
 #
-# See cpt.yaml header for full architecture notes.
+# Set base_model to any HF model ID or local path.
+# Set lora.target_modules: auto for automatic projection detection.
 
 base_model: models/sft/merged
 max_seq_len: 4096
 load_in_4bit: true
 enable_thinking: false
+# auto = freeze if vision parameters detected; skip silently for pure LLMs.
+freeze_vision_encoder: auto
 
 lora:
   r: 32
   alpha: 64
   dropout: 0.05
   use_rslora: true
-  target_modules:
-    - q_proj
-    - k_proj
-    - v_proj
-    - o_proj
-    - in_proj_qkv
-    - out_proj
-    - in_proj_z
-    - in_proj_a
-    - in_proj_b
-    - gate_proj
-    - up_proj
-    - down_proj
+  # "auto" inspects the loaded model and detects common projection names.
+  # Override with an explicit list for uncommon architectures (see configs/models/).
+  target_modules: auto
 
 train_files: data/processed/dpo/train.jsonl
 eval_files: data/processed/dpo/val.jsonl

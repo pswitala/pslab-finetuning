@@ -1,36 +1,31 @@
 # Supervised Fine-Tuning (SFT) config — QLoRA via Unsloth + TRL SFTTrainer.
-# Starts from the merged CPT checkpoint (or directly from Qwen/Qwen3.6-27B if
-# CPT is skipped).
+# Starts from the merged CPT checkpoint (or directly from any instruct model).
 #
-# See cpt.yaml header for full architecture notes.
-# Key for SFT: model is instruct-mode by default; set enable_thinking: false so
-# training examples don't have stray <think> tokens in the labels.
+# Set base_model to any HF model ID or local path.
+# Set lora.target_modules: auto for automatic projection detection,
+# or see configs/models/ for per-architecture presets.
 
-base_model: /home/pswitala/models/cpt-merged     # copy of merged from ntfs to ext4 on wsl / eg set to Qwen/Qwen3.6-27B to skip CPT stage
+base_model: /home/pswitala/models/cpt-merged     # or any HF model ID / local path
 max_seq_len: 4096
 load_in_4bit: true
-# chat_template: do NOT set "qwen3" here — use the model's own built-in template
-# (Qwen3.6-27B ships with chat_template.jinja). sft.py will apply it directly.
-enable_thinking: false            # disable <think> blocks in training labels
+enable_thinking: false            # disable <think> blocks in training labels (Qwen-specific; ignored by others)
+# auto = freeze if vision parameters detected; skip silently for pure LLMs.
+freeze_vision_encoder: auto
+# Response separator tokens for train_on_responses_only.
+# ChatML (Qwen, Llama-3-Instruct, Mistral v0.3+): keep defaults below.
+# Llama-2:  instruction_part: "[INST] "    response_part: " [/INST]"
+# Phi-3:    instruction_part: "<|user|>\n" response_part: "<|assistant|>\n"
+instruction_part: "<|im_start|>user\n"
+response_part: "<|im_start|>assistant\n"
 
 lora:
   r: 32
   alpha: 64
   dropout: 0.05
   use_rslora: true
-  target_modules:
-    - q_proj
-    - k_proj
-    - v_proj
-    - o_proj
-    - in_proj_qkv
-    - out_proj
-    - in_proj_z
-    - in_proj_a
-    - in_proj_b
-    - gate_proj
-    - up_proj
-    - down_proj
+  # "auto" inspects the loaded model and detects common projection names.
+  # Override with an explicit list for uncommon architectures (see configs/models/).
+  target_modules: auto
 
 train_files: data/processed/sft/train.jsonl
 eval_files: data/processed/sft/val.jsonl

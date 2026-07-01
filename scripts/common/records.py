@@ -86,7 +86,7 @@ def get_json(session: requests.Session, url: str, *, params: dict | None = None,
     for attempt in range(retries):
         try:
             resp = session.get(url, params=params, timeout=timeout,
-                               headers={"User-Agent": "qwen-pl-ingest/0.1"})
+                               headers={"User-Agent": "pslab-ingest/0.1"})
             last_resp = resp
             resp.raise_for_status()
             return resp.json()
@@ -107,7 +107,7 @@ def get_text(session: requests.Session, url: str, *, retries: int = 8,
     for attempt in range(retries):
         try:
             resp = session.get(url, timeout=timeout,
-                               headers={"User-Agent": "qwen-pl-ingest/0.1"})
+                               headers={"User-Agent": "pslab-ingest/0.1"})
             last_resp = resp
             resp.raise_for_status()
             return resp.text
