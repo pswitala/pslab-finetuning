@@ -72,7 +72,7 @@ def process_shard(shard: str, out_path: Path, shard_index: int) -> int:
                 "lang": "en",
                 "meta": {
                     "url": row.get("url", ""),
-                    "timestamp": row.get("timestamp", ""),
+                    "timestamp": str(row.get("timestamp", "")),
                 },
             }
             out_fh.write(json.dumps(record, ensure_ascii=False) + "\n")
