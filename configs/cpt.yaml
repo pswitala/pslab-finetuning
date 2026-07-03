@@ -10,6 +10,9 @@ load_in_4bit: true         # NF4; or NVFP4 if bitsandbytes gains Blackwell suppo
 # card — a 27B bf16 model needs ~54 GB. false forces the PEFT+bnb NF4 path (~14 GB).
 # On the 96 GB reference rig you can set this true to use Unsloth's faster kernels.
 use_unsloth: false
+# Attention kernel: sdpa (PyTorch-native, fast on Blackwell) is the default in _common.py;
+# set to "eager" only for debugging or archs without SDPA. flash-attn is avoided on Blackwell.
+attn_implementation: sdpa
 # auto = freeze if vision parameters detected; skip silently for pure LLMs.
 # true = always freeze. false = never freeze.
 freeze_vision_encoder: auto

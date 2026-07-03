@@ -185,6 +185,22 @@ _MODEL_LOADERS = [
 ]
 
 
+def _is_attn_impl_error(exc: Any) -> bool:
+    """True if an exception looks like an unsupported `attn_implementation`.
+
+    Lets the loader retry with eager attention only when SDPA is genuinely unsupported by
+    the architecture, rather than masking unrelated load failures (wrong arch, OOM, etc.).
+    """
+    if exc is None:
+        return False
+    text = str(exc).lower()
+    return (
+        "attn_implementation" in text
+        or "scaled_dot_product" in text
+        or ("does not support" in text and "attention" in text)
+    )
+
+
 def _disable_broken_causal_conv1d() -> None:
     """Neutralize an ABI-mismatched causal_conv1d wheel before loading SSM models.
 
@@ -240,20 +256,33 @@ def _load_peft_fallback(cfg: dict) -> LoadedModel:
         device_map="auto",
         trust_remote_code=True,
     )
-    model = None
-    used_cls_name = None
-    last_exc = None
-    for cls_name in _MODEL_LOADERS:
-        try:
-            cls = getattr(importlib.import_module("transformers"), cls_name)
-            model = cls.from_pretrained(cfg["base_model"], **load_kwargs)
-            used_cls_name = cls_name
-            print(f"[_common] loaded with {cls_name}")
-            break
-        except Exception as exc:  # noqa: BLE001
-            last_exc = exc
-            msg = str(exc).splitlines()[0] if str(exc) else ""
-            print(f"[_common] {cls_name} failed ({exc.__class__.__name__}: {msg}); trying next...")
+
+    # SDPA attention: PyTorch-native, Blackwell-friendly, and far faster than eager at long
+    # sequence lengths — many architectures otherwise default to eager (~O(len²) Python-heavy)
+    # and crawl. flash-attn is intentionally avoided on Blackwell. Overridable via
+    # cfg["attn_implementation"]; falls back to eager for architectures that lack SDPA.
+    attn_pref = cfg.get("attn_implementation", "sdpa")
+
+    def _try_loaders(attn_impl):
+        exc_seen = None
+        for cls_name in _MODEL_LOADERS:
+            try:
+                cls = getattr(importlib.import_module("transformers"), cls_name)
+                m = cls.from_pretrained(
+                    cfg["base_model"], attn_implementation=attn_impl, **load_kwargs)
+                print(f"[_common] loaded with {cls_name} (attn_implementation={attn_impl})")
+                return m, cls_name, None
+            except Exception as exc:  # noqa: BLE001
+                exc_seen = exc
+                msg = str(exc).splitlines()[0] if str(exc) else ""
+                print(f"[_common] {cls_name} failed (attn={attn_impl}) "
+                      f"({exc.__class__.__name__}: {msg}); trying next...")
+        return None, None, exc_seen
+
+    model, used_cls_name, last_exc = _try_loaders(attn_pref)
+    if model is None and attn_pref != "eager" and _is_attn_impl_error(last_exc):
+        print(f"[_common] attn_implementation={attn_pref} unsupported here; retrying with eager")
+        model, used_cls_name, last_exc = _try_loaders("eager")
     if model is None:
         raise RuntimeError(
             f"Could not load {cfg['base_model']} with any Auto class. "
