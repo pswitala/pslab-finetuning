@@ -18,17 +18,20 @@ scales to the ~400 GB+ corpus, unlike an in-memory shuffle.
 
 Usage:
     python scripts/process/build_cpt_mix.py \
-        --pl "data/interim/dedup/**/*.jsonl" \
+        --pl "data/interim/dedup/**/*.jsonl*" \
         --en "data/raw/replay_en/**/*.jsonl" \
         --out data/processed/cpt \
         --replay-fraction 0.18 --val-fraction 0.005 \
         --commercial-safe
+
+    NOTE: use *.jsonl* (not *.jsonl) for datatrove outputs — they are gzipped (.jsonl.gz).
 """
 
 from __future__ import annotations
 
 import argparse
 import glob
+import gzip
 import json
 import math
 import random
@@ -41,10 +44,22 @@ from common.records import is_commercial_safe  # noqa: E402
 _SCHEMA_FIELDS = ("text", "domain", "source", "license")
 
 
+def _open_text(path: str):
+    """Open plain OR gzipped jsonl transparently.
+
+    datatrove (pipeline.py / dedup.py) writes gzipped shards (`*.jsonl.gz`); catalog/ingest
+    outputs are plain `.jsonl`. A plain open() on a .gz silently yields no parseable lines,
+    which is exactly how the entire deduped web corpus got dropped from the CPT mix.
+    """
+    if path.endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8")
+    return open(path, encoding="utf-8")
+
+
 def iter_jsonl(globs: list[str]):
     for g in globs:
         for path in glob.glob(g, recursive=True):
-            with open(path, encoding="utf-8") as fh:
+            with _open_text(path) as fh:
                 for line in fh:
                     line = line.strip()
                     if line:
