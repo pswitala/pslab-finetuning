@@ -173,10 +173,15 @@ def load_model_and_tokenizer(cfg: dict) -> LoadedModel:
         return _load_peft_fallback(cfg)
 
 
+# Ordered by likelihood for our targets (decoder-only LMs and text-generating VLMs).
+# transformers v5 renamed the VLM class AutoModelForVision2Seq -> AutoModelForImageTextToText;
+# the old name is kept last for pre-v5 compatibility. Classes absent in the installed
+# transformers raise AttributeError and are skipped.
 _MODEL_LOADERS = [
     "AutoModelForCausalLM",
-    "AutoModelForSeq2SeqLM",
+    "AutoModelForImageTextToText",
     "AutoModelForVision2Seq",
+    "AutoModelForSeq2SeqLM",
 ]
 
 
@@ -217,7 +222,8 @@ def _load_peft_fallback(cfg: dict) -> LoadedModel:
             break
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
-            print(f"[_common] {cls_name} failed ({exc.__class__.__name__}); trying next...")
+            msg = str(exc).splitlines()[0] if str(exc) else ""
+            print(f"[_common] {cls_name} failed ({exc.__class__.__name__}: {msg}); trying next...")
     if model is None:
         raise RuntimeError(
             f"Could not load {cfg['base_model']} with any Auto class. "
@@ -307,7 +313,8 @@ def load_for_merge(cfg: dict) -> LoadedModel:
             break
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
-            print(f"[_common] {cls_name} failed ({exc.__class__.__name__}); trying next...")
+            msg = str(exc).splitlines()[0] if str(exc) else ""
+            print(f"[_common] {cls_name} failed ({exc.__class__.__name__}: {msg}); trying next...")
     if model is None:
         raise RuntimeError(
             f"Could not load {cfg['base_model']} for merge with any Auto class. "
