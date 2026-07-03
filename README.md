@@ -448,6 +448,56 @@ Observed results from the CPT pilot run on this machine:
 
 ---
 
+### Understanding the core training knobs
+
+Four config keys — `per_device_train_batch_size`, `gradient_accumulation_steps`,
+`max_steps`, and `max_seq_len` — control the memory / speed / quality trade-off of every
+training stage (CPT, SFT, DPO). They are the first things to touch when adapting the recipe
+to a different GPU (e.g. a 48 GB card instead of the 96 GB reference rig).
+
+**The number that actually matters — effective batch size:**
+
+```
+effective batch size = per_device_train_batch_size × gradient_accumulation_steps × num_GPUs
+```
+
+This is how many samples contribute to **one weight update**. The optimizer only sees this
+product — but the two factors cost very different resources: **`per_device_train_batch_size`
+costs VRAM, `gradient_accumulation_steps` costs wall-clock time.** The rule of thumb: raise
+`per_device_train_batch_size` until VRAM is nearly full, then use
+`gradient_accumulation_steps` to reach your target effective batch.
+
+| Knob | Scope | Larger → | Smaller → |
+|---|---|---|---|
+| **`per_device_train_batch_size`** | int ≥ 1 (VRAM-bound; ~1–2 for 27B @ seq 4096, more at seq 2048) | more VRAM used (activations scale ~linearly), better GPU utilization/throughput, less kernel-launch overhead — too high **OOMs** | less VRAM, OOM-safe, but underfeeds the GPU (worse utilization). `1` is the memory floor |
+| **`gradient_accumulation_steps`** | int ≥ 1 (commonly 1–64) | bigger *effective* batch → smoother/more stable gradients, but **proportionally slower per logged step** (32 = 32 micro-batches before one update) and fewer updates per epoch | faster steps, more frequent updates, **noisier gradients**. `1` updates after every micro-batch |
+| **`max_steps`** | int; `-1` / omit = run `num_train_epochs` fully | more of the dataset seen → more learning, longer run | finishes sooner. Only for smoke tests — 20 steps confirms the pipeline runs, it does **not** produce a usable model |
+| **`max_seq_len`** | int, ~512–8192+ (≤ model context limit) | learns longer-range dependencies, but activation memory + attention compute grow with length (attention ~O(len²), SSM ~O(len)) → slower, more VRAM | cheaper/faster per token, less VRAM, but caps the context the weights adapt to |
+
+**How they interact:**
+
+- **VRAM (OOM levers):** driven by `per_device_train_batch_size × max_seq_len` (activations),
+  on top of the fixed ~14 GB 4-bit weights + LoRA + optimizer states. Halving `max_seq_len`
+  roughly halves activation memory, which can free room for a larger batch.
+- **Wall-clock per step:** driven by `per_device_train_batch_size × gradient_accumulation_steps
+  × max_seq_len` (total tokens processed before each update).
+- **Model quality:** driven by the *effective batch size* (first two multiplied) and *how much
+  data is seen* (`max_steps` / epochs × `max_seq_len`).
+
+> One "step" = one **optimizer step** = `gradient_accumulation_steps` micro-batches. So
+> `max_steps: 20` with `gradient_accumulation_steps: 4` runs 80 forward/backward passes.
+
+**Practical recipe:**
+
+- *Smoke test:* everything small (e.g. `per_device_train_batch_size: 1`,
+  `gradient_accumulation_steps: 4`, `max_steps: 20`, `max_seq_len: 2048`) → steps in seconds,
+  just enough to watch the loss fall and confirm the stack is healthy.
+- *Full run:* push `per_device_train_batch_size` as high as VRAM allows at your chosen
+  `max_seq_len`, set `gradient_accumulation_steps` for an effective batch of ~16–32 (stable CPT),
+  `max_seq_len: 4096`, and remove `max_steps` (let `num_train_epochs` govern length).
+
+---
+
 ### Step 6 — Continued Pretraining (CPT)
 
 **What it does:** Trains the model on raw Polish text (web corpora, Wikipedia, legal acts, GUS statistics) plus English replay using next-token prediction on packed sequences. Produces a Polish-fluent model that still follows instructions. This is the most compute-intensive stage.

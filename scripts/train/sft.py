@@ -133,6 +133,10 @@ def main() -> int:
         max_length=cfg.get("max_seq_len", 4096),
         packing=cfg.get("packing", False),
         per_device_train_batch_size=cfg.get("per_device_train_batch_size", 8),
+        # Eval defaults to the train batch size, not HF's default of 8 — eval materializes
+        # full-sequence logits (batch × seq × vocab, fp32); large vocabularies OOM otherwise.
+        per_device_eval_batch_size=cfg.get(
+            "per_device_eval_batch_size", cfg.get("per_device_train_batch_size", 1)),
         gradient_accumulation_steps=cfg.get("gradient_accumulation_steps", 4),
         learning_rate=float(cfg.get("learning_rate", 2e-4)),
         lr_scheduler_type=cfg.get("lr_scheduler", "cosine"),

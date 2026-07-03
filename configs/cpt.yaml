@@ -5,7 +5,6 @@
 # or see configs/models/ for per-architecture presets.
 
 base_model: Qwen/Qwen3.6-27B
-max_seq_len: 4096          # safe default; 96 GB allows ~8192 — raise after a pilot
 load_in_4bit: true         # NF4; or NVFP4 if bitsandbytes gains Blackwell support
 # Unsloth loads this Qwen3_5 VLM in bf16 (ignores load_in_4bit), which OOMs a 48 GB
 # card — a 27B bf16 model needs ~54 GB. false forces the PEFT+bnb NF4 path (~14 GB).
@@ -62,9 +61,11 @@ seed: 3407
 
 #pilot run
 per_device_train_batch_size: 1
-gradient_accumulation_steps: 32
-max_steps: 200
+gradient_accumulation_steps: 4    # was 32 → ~8× faster steps (~22 s/it)
+max_steps: 20
+max_seq_len: 2048
 
 #full run remove max_steps
 #per_device_train_batch_size: 2
 #gradient_accumulation_steps: 16
+#max_seq_len: 4096          # safe default; 96 GB allows ~8192 — raise after a pilot

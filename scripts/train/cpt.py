@@ -68,6 +68,11 @@ def main() -> int:
         max_length=cfg.get("max_seq_len", 4096),
         packing=cfg.get("packing", False),
         per_device_train_batch_size=cfg.get("per_device_train_batch_size", 4),
+        # Eval defaults to the *train* batch size, not HF's default of 8. Eval materializes
+        # full-sequence logits (batch × seq × vocab, upcast to fp32) — with large-vocab models
+        # (e.g. Gemma's ~256k) an eval batch of 8 OOMs even when batch=1 trains fine.
+        per_device_eval_batch_size=cfg.get(
+            "per_device_eval_batch_size", cfg.get("per_device_train_batch_size", 1)),
         gradient_accumulation_steps=cfg.get("gradient_accumulation_steps", 8),
         learning_rate=float(cfg.get("learning_rate", 1e-4)),
         lr_scheduler_type=cfg.get("lr_scheduler", "cosine"),
