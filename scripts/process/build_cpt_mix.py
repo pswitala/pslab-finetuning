@@ -56,17 +56,31 @@ def _open_text(path: str):
     return open(path, encoding="utf-8")
 
 
+_META_FIELDS = ("license", "source", "domain", "snapshot_date")
+
+
 def iter_jsonl(globs: list[str]):
     for g in globs:
         for path in glob.glob(g, recursive=True):
             with _open_text(path) as fh:
                 for line in fh:
                     line = line.strip()
-                    if line:
-                        try:
-                            yield json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    # datatrove (pipeline.py / dedup.py) moves the ingest fields into a
+                    # nested "metadata" object. Surface the ones we filter/tag on so
+                    # top-level rec.get("license"/"source") works — otherwise every
+                    # deduped doc reads as license "unknown" and --commercial-safe drops it.
+                    meta = rec.get("metadata")
+                    if isinstance(meta, dict):
+                        for k in _META_FIELDS:
+                            if not rec.get(k) and meta.get(k) is not None:
+                                rec[k] = meta[k]
+                    yield rec
 
 
 def license_ok(rec: dict, commercial_safe: bool) -> bool:
