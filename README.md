@@ -286,6 +286,15 @@ using datatrove defaults). Tune the curve with `--hashes-per-bucket` (default 8)
 
 **Why streaming (not an in-memory shuffle):** The builder never loads the corpus into RAM. It makes two lightweight counting passes (to size the English replay), then a single writing pass that assigns each document to a random parquet shard and Bernoulli-samples the English stream down to the target fraction. Random shard assignment gives an approximate global shuffle — so Polish and English are interleaved at the document level and each batch sees a mixture — while scaling to the 400 GB+ corpus that an in-memory `shuffle()` could never hold. (The trainer also shuffles per epoch on top of this.)
 
+**Why `--max-per-source` (balancing a dominant source):** Sources differ enormously in count and length. GUS BDL alone contributes ~5.5 M short (~130-token) statistic sentences — that can be **half the total token budget**, drowning out the longer web/legal prose that actually drives *fluency*, and inflating the step count (and wall-clock) of the run. `--max-per-source SOURCE=N` uniformly random-subsamples a source down to `N` documents — the same Bernoulli trick used for the English replay, so it doesn't bias toward whichever shard streamed first. Capping GUS both **shortens the run** (fewer tokens → fewer steps) and **rebalances toward prose**. The English replay is sized off the *post-cap* Polish count, so the 18% ratio stays correct. Example: `--max-per-source gus_bdl=1000000` keeps ~1 M of 5.5 M GUS records (roughly halving total tokens and cutting a ~15-day run to ~9 days on a 48 GB card). Inspect the mix by source with:
+```python
+import pyarrow.dataset as ds, collections
+d = ds.dataset("data/processed/cpt/train", format="parquet"); c = collections.Counter()
+for b in d.to_batches(columns=["domain","source"]):
+    for dom, src in zip(b.column("domain").to_pylist(), b.column("source").to_pylist()): c[(dom,src)] += 1
+print(c.most_common())
+```
+
 ```bash
 python scripts/process/build_cpt_mix.py \
     --pl "data/interim/dedup/**/*.jsonl*" \
@@ -293,9 +302,12 @@ python scripts/process/build_cpt_mix.py \
     --en "data/raw/replay_en/**/*.jsonl" \
     --out data/processed/cpt \
     --replay-fraction 0.18 \
+    --max-per-source gus_bdl=1000000 \
     --commercial-safe
 # NOTE: dedup output is gzipped (*.jsonl.gz) — use *.jsonl* so the glob matches it,
 # otherwise the entire deduped web corpus is silently skipped.
+# --max-per-source SOURCE=N caps a source (uniform random subsample); repeatable, e.g.
+#   --max-per-source gus_bdl=1000000 c4=800000.  Uncapped sources are unaffected.
 # Output: data/processed/cpt/train/*.parquet  +  .../val/*.parquet
 ```
 
@@ -776,7 +788,7 @@ python scripts/process/dedup.py    --input data/interim/clean --output data/inte
 
 # 4. datasets  (carve the eval holdout out of catalogs first, before building anything)
 python scripts/process/make_holdout.py  --input "data/catalogs/**/*.jsonl" --train-out data/catalogs_train --holdout-out data/catalogs/_holdout --fraction 0.02
-python scripts/process/build_cpt_mix.py --pl "data/interim/dedup/**/*.jsonl*" "data/catalogs_train/**/*.jsonl" --en "data/raw/replay_en/**/*.jsonl" --out data/processed/cpt --commercial-safe  # *.jsonl* — dedup output is gzipped
+python scripts/process/build_cpt_mix.py --pl "data/interim/dedup/**/*.jsonl*" "data/catalogs_train/**/*.jsonl" --en "data/raw/replay_en/**/*.jsonl" --out data/processed/cpt --max-per-source gus_bdl=1000000 --commercial-safe  # *.jsonl* — dedup gzipped; cap dominant GUS
 python scripts/process/build_sft_qa.py  --input "data/catalogs_train/**/*.jsonl" --out data/processed/sft/catalog_qa.jsonl --mode template
 python scripts/process/build_sft_qa.py  --input "data/catalogs_train/**/*.jsonl" --out data/processed/sft/agentic/tool_qa.jsonl --mode agentic
 python scripts/process/build_dpo.py     --input data/raw/dolci-dpo-pl/data.jsonl --out data/processed/dpo --val 500

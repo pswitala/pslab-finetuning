@@ -25,11 +25,14 @@ Usage:
         --commercial-safe
 
     NOTE: use *.jsonl* (not *.jsonl) for datatrove outputs — they are gzipped (.jsonl.gz).
+    Downweight a dominant source (e.g. cap the 5.5M short GUS records) with:
+        --max-per-source gus_bdl=1000000
 """
 
 from __future__ import annotations
 
 import argparse
+import collections
 import glob
 import gzip
 import json
@@ -89,12 +92,13 @@ def license_ok(rec: dict, commercial_safe: bool) -> bool:
     return is_commercial_safe(rec.get("license", "unknown"))
 
 
-def count_docs(globs: list[str], commercial_safe: bool) -> tuple[int, int]:
+def count_docs(globs: list[str], commercial_safe: bool) -> tuple[int, int, dict[str, int]]:
     """Stream-count docs with non-empty text (and, optionally, a safe license).
 
-    Returns (kept, license_skipped).
+    Returns (kept, license_skipped, per_source_counts).
     """
     kept = skipped = 0
+    per_source: dict[str, int] = collections.Counter()
     for rec in iter_jsonl(globs):
         if not (rec.get("text") or "").strip():
             continue
@@ -102,7 +106,8 @@ def count_docs(globs: list[str], commercial_safe: bool) -> tuple[int, int]:
             skipped += 1
             continue
         kept += 1
-    return kept, skipped
+        per_source[rec.get("source", "corpus")] += 1
+    return kept, skipped, per_source
 
 
 class ShardedParquetWriter:
@@ -160,8 +165,20 @@ def main() -> int:
     ap.add_argument("--val-fraction", type=float, default=0.005)
     ap.add_argument("--shard-size", type=int, default=100_000, help="target docs per shard")
     ap.add_argument("--commercial-safe", action="store_true")
+    ap.add_argument("--max-per-source", nargs="*", default=[], metavar="SOURCE=N",
+                    help="cap docs kept per source via uniform random subsample, e.g. "
+                         "--max-per-source gus_bdl=1000000. Uncapped sources unaffected.")
     ap.add_argument("--seed", type=int, default=3407)
     args = ap.parse_args()
+
+    caps: dict[str, int] = {}
+    for spec in args.max_per_source:
+        src, sep, n = spec.partition("=")
+        if not sep or not n.isdigit():
+            print(f"bad --max-per-source spec {spec!r}; expected SOURCE=N "
+                  f"(e.g. gus_bdl=1000000)")
+            return 1
+        caps[src] = int(n)
 
     try:
         import pyarrow  # noqa: F401
@@ -171,9 +188,29 @@ def main() -> int:
 
     rng = random.Random(args.seed)
 
-    # Pass 1 — count (streaming) to size the EN replay stream.
-    n_pl, skipped_lic = count_docs(args.pl, args.commercial_safe)
-    print(f"Polish docs kept: {n_pl} (license-skipped: {skipped_lic})")
+    # Pass 1 — count (streaming) to size the EN replay stream and per-source caps.
+    n_pl_raw, skipped_lic, per_source = count_docs(args.pl, args.commercial_safe)
+    # Per-source caps: uniform random subsample down to the cap (same Bernoulli trick as
+    # the EN replay), so a dominant source (e.g. 5.5M short GUS records) can be downweighted
+    # without biasing toward whichever shard happened to stream first.
+    source_p: dict[str, float] = {}
+    n_pl = 0
+    for src, cnt in per_source.items():
+        cap = caps.get(src)
+        if cap is not None and 0 <= cap < cnt:
+            source_p[src] = cap / cnt
+            n_pl += cap
+        else:
+            source_p[src] = 1.0
+            n_pl += cnt
+    print(f"Polish docs kept: {n_pl} of {n_pl_raw} (license-skipped: {skipped_lic})")
+    for src in caps:
+        if src in per_source:
+            print(f"  cap {src}: {per_source[src]} -> ~{min(caps[src], per_source[src])} "
+                  f"(accept prob {source_p[src]:.4f})")
+        else:
+            print(f"  WARNING: --max-per-source {src}=... but source '{src}' "
+                  f"not present in --pl")
     if n_pl == 0:
         print("no Polish docs — nothing to do")
         return 1
@@ -183,7 +220,7 @@ def main() -> int:
     p_en = 0.0
     n_en_total = 0
     if target_en and args.en:
-        n_en_total, _ = count_docs(args.en, False)  # replay isn't license-filtered
+        n_en_total, _, _ = count_docs(args.en, False)  # replay isn't license-filtered
         p_en = min(1.0, target_en / n_en_total) if n_en_total else 0.0
         print(f"English replay: target {target_en} of {n_en_total} available "
               f"(accept prob {p_en:.4f})")
@@ -215,8 +252,12 @@ def main() -> int:
             continue
         if args.commercial_safe and not license_ok(rec, True):
             continue
+        src = rec.get("source", "corpus")
+        p = source_p.get(src, 1.0)
+        if p < 1.0 and rng.random() >= p:   # per-source cap subsample
+            continue
         emit({"text": text, "domain": "pl",
-              "source": rec.get("source", "corpus"),
+              "source": src,
               "license": rec.get("license", "unknown")})
 
     if p_en > 0:
