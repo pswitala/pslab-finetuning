@@ -288,12 +288,14 @@ using datatrove defaults). Tune the curve with `--hashes-per-bucket` (default 8)
 
 ```bash
 python scripts/process/build_cpt_mix.py \
-    --pl "data/interim/dedup/**/*.jsonl" \
+    --pl "data/interim/dedup/**/*.jsonl*" \
          "data/catalogs/**/*.jsonl" \
     --en "data/raw/replay_en/**/*.jsonl" \
     --out data/processed/cpt \
     --replay-fraction 0.18 \
     --commercial-safe
+# NOTE: dedup output is gzipped (*.jsonl.gz) — use *.jsonl* so the glob matches it,
+# otherwise the entire deduped web corpus is silently skipped.
 # Output: data/processed/cpt/train/*.parquet  +  .../val/*.parquet
 ```
 
@@ -774,7 +776,7 @@ python scripts/process/dedup.py    --input data/interim/clean --output data/inte
 
 # 4. datasets  (carve the eval holdout out of catalogs first, before building anything)
 python scripts/process/make_holdout.py  --input "data/catalogs/**/*.jsonl" --train-out data/catalogs_train --holdout-out data/catalogs/_holdout --fraction 0.02
-python scripts/process/build_cpt_mix.py --pl "data/interim/dedup/**/*.jsonl" "data/catalogs_train/**/*.jsonl" --en "data/raw/replay_en/**/*.jsonl" --out data/processed/cpt --commercial-safe
+python scripts/process/build_cpt_mix.py --pl "data/interim/dedup/**/*.jsonl*" "data/catalogs_train/**/*.jsonl" --en "data/raw/replay_en/**/*.jsonl" --out data/processed/cpt --commercial-safe  # *.jsonl* — dedup output is gzipped
 python scripts/process/build_sft_qa.py  --input "data/catalogs_train/**/*.jsonl" --out data/processed/sft/catalog_qa.jsonl --mode template
 python scripts/process/build_sft_qa.py  --input "data/catalogs_train/**/*.jsonl" --out data/processed/sft/agentic/tool_qa.jsonl --mode agentic
 python scripts/process/build_dpo.py     --input data/raw/dolci-dpo-pl/data.jsonl --out data/processed/dpo --val 500
