@@ -7,6 +7,10 @@
 base_model: Qwen/Qwen3.6-27B
 max_seq_len: 4096          # safe default; 96 GB allows ~8192 — raise after a pilot
 load_in_4bit: true         # NF4; or NVFP4 if bitsandbytes gains Blackwell support
+# Unsloth loads this Qwen3_5 VLM in bf16 (ignores load_in_4bit), which OOMs a 48 GB
+# card — a 27B bf16 model needs ~54 GB. false forces the PEFT+bnb NF4 path (~14 GB).
+# On the 96 GB reference rig you can set this true to use Unsloth's faster kernels.
+use_unsloth: false
 # auto = freeze if vision parameters detected; skip silently for pure LLMs.
 # true = always freeze. false = never freeze.
 freeze_vision_encoder: auto

@@ -8,6 +8,7 @@
 base_model: models/cpt/merged     # merged CPT checkpoint (repo-relative); or any HF model ID / local path
 max_seq_len: 4096
 load_in_4bit: true
+use_unsloth: false                # Qwen3_5 VLM: Unsloth loads bf16 (OOMs 48 GB); force PEFT+bnb NF4. See configs/cpt.yaml.
 enable_thinking: false            # disable <think> blocks in training labels (Qwen-specific; ignored by others)
 # auto = freeze if vision parameters detected; skip silently for pure LLMs.
 freeze_vision_encoder: auto

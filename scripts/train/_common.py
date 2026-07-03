@@ -8,6 +8,10 @@ Config keys consumed here:
   lora.target_modules   — projection name list, or "auto" for auto-detection
   freeze_vision_encoder — "auto" | true | false  (default: "auto")
   load_in_4bit          — NF4 quantization
+  use_unsloth           — try the Unsloth fast path first (default: true). Set false
+                          (or export PSLAB_NO_UNSLOTH=1) to go straight to PEFT+bnb.
+                          Needed for Qwen3_5/Qwen3.6 VLMs, which Unsloth loads in bf16
+                          instead of 4-bit — fine on 96 GB, OOMs on <=48 GB cards.
   bf16, gradient_checkpointing
 """
 
@@ -118,7 +122,17 @@ def load_model_and_tokenizer(cfg: dict) -> LoadedModel:
 
     Tries Unsloth first (fast kernels); falls back to PEFT + bitsandbytes
     if Unsloth does not support this architecture.
+
+    Set use_unsloth: false (or PSLAB_NO_UNSLOTH=1) to skip Unsloth entirely. Required
+    for Qwen3_5/Qwen3.6 VLMs: Unsloth "succeeds" but loads them in bf16 (ignoring
+    load_in_4bit), so no exception fires to trigger the fallback — and a 27B bf16 model
+    OOMs on a 48 GB card. The explicit PEFT+bnb path below always applies NF4.
     """
+    import os
+    if not cfg.get("use_unsloth", True) or os.environ.get("PSLAB_NO_UNSLOTH"):
+        print("[_common] Unsloth disabled (use_unsloth=false / PSLAB_NO_UNSLOTH); "
+              "loading via PEFT + bitsandbytes.")
+        return _load_peft_fallback(cfg)
     try:
         from unsloth import FastLanguageModel
         import torch
