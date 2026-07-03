@@ -185,12 +185,42 @@ _MODEL_LOADERS = [
 ]
 
 
+def _disable_broken_causal_conv1d() -> None:
+    """Neutralize an ABI-mismatched causal_conv1d wheel before loading SSM models.
+
+    Qwen3.6/Qwen3_5 Gated DeltaNet layers import the causal_conv1d CUDA extension. If
+    the installed wheel was built against a different torch ABI, importing it raises
+    ImportError ("undefined symbol: ...c10_cuda_check_implementation..."), which aborts
+    model loading in the PEFT path. When the extension is broken we tell transformers
+    the package is unavailable so the model uses the (slower) torch SSM fallback — the
+    same workaround Unsloth applies ("Detected broken causal_conv1d binary").
+
+    A healthy install imports cleanly and is left untouched, so the fast path stays
+    enabled wherever it actually works (e.g. the 96 GB reference rig).
+    """
+    try:
+        import causal_conv1d_cuda  # noqa: F401  # the compiled extension that may be broken
+        return  # healthy — keep the fast path
+    except ImportError as exc:
+        try:
+            import transformers.utils.import_utils as iu
+            iu.is_causal_conv1d_available = lambda *a, **k: False
+        except Exception:  # noqa: BLE001
+            return
+        print(f"[_common] broken/absent causal_conv1d ({exc.__class__.__name__}); "
+              "forcing torch SSM fallback")
+    except Exception:  # noqa: BLE001
+        return
+
+
 def _load_peft_fallback(cfg: dict) -> LoadedModel:
     """PEFT path — used when Unsloth is unavailable or does not support this architecture."""
     import importlib
     import torch
     from transformers import AutoTokenizer, BitsAndBytesConfig
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+
+    _disable_broken_causal_conv1d()
 
     lora = cfg["lora"]
     quant = None
@@ -298,6 +328,7 @@ def load_for_merge(cfg: dict) -> LoadedModel:
     from transformers import AutoTokenizer
     from peft import PeftModel
 
+    _disable_broken_causal_conv1d()
     adapter_dir = cfg["output_dir"]
     tokenizer = AutoTokenizer.from_pretrained(cfg["base_model"], trust_remote_code=True)
 
