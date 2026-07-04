@@ -800,9 +800,42 @@ ollama run qwen-pl "Opisz krótko Konstytucję RP."
 
 ## Development
 
-The `Makefile` gives one entrypoint per stage instead of copy-pasting commands — run
-`make help` to list targets (`make env`, `make dedup`, `make build-agentic`, `make cpt`,
-`make eval-agentic`, `make gguf`, …). Override paths with `VAR=value`.
+### Makefile — one entrypoint per stage
+
+The `Makefile` is a **task runner** (not a build system — there's nothing to compile). Each
+target wraps the canonical command for a pipeline stage so runs are reproducible from one
+place instead of copy-pasting the long `python scripts/...` lines. Run it from the repo root:
+
+```bash
+make help          # list all targets
+make env           # → python scripts/check_env.py
+make cpt           # → python scripts/train/cpt.py --config configs/cpt.yaml
+make cpt-merge     # → ...cpt.py --config configs/cpt.yaml --merge
+```
+
+**Override the defaults** with `VAR=value` on the command line (`?=` vars: `PY`, `CPT_CFG`,
+`SFT_CFG`, `DPO_CFG`):
+
+```bash
+make cpt CPT_CFG=configs/cpt_gemma.yaml   # different config
+make cpt PY=python3.12                     # different interpreter
+```
+
+**Targets, grouped** (intended order, top-to-bottom):
+
+| Group | Targets |
+|---|---|
+| dev | `env` · `test` · `lint` |
+| data | `ingest` · `process` · `dedup` · `build-cpt` · `build-sft` · `build-agentic` |
+| training | `cpt` / `cpt-merge` · `sft` / `sft-merge` · `dpo` / `dpo-merge` |
+| eval + export | `eval` · `eval-agentic` · `gguf` |
+
+> **⚠ The data targets are simplified and can lag the commands in Steps 1–4.** In particular
+> `build-cpt` uses the bare `*.jsonl` glob (misses the gzipped `*.jsonl.gz` dedup shards → drops
+> the whole web corpus) and omits `--max-per-source` and the catalogs path; `ingest` uses
+> minimal args. **Use `make` for the training / eval / export stages** (they read the configs,
+> so they honor every config edit), but **build the datasets with the explicit Step 1–4
+> commands** above until the Makefile targets are brought in line.
 
 Pure-logic modules (license filtering, tool schemas + validation, LoRA target detection,
 tool-call parsing, dedup band math, Polish quality heuristics) have unit tests that need no
