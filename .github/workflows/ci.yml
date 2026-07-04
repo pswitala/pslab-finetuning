@@ -1,9 +1,13 @@
 name: ci
 
+# Automatic runs on push/PR are disabled. Trigger manually from the GitHub Actions tab
+# ("Run workflow") or with `gh workflow run ci.yml`. To re-enable auto-CI, uncomment the
+# push / pull_request triggers below.
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
+  # push:
+  #   branches: [main]
+  # pull_request:
 
 jobs:
   lint-and-test:
