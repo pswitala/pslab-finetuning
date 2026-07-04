@@ -512,6 +512,54 @@ costs VRAM, `gradient_accumulation_steps` costs wall-clock time.** The rule of t
 
 ---
 
+### Checkpointing — saving, resuming, and stopping safely
+
+Checkpoints apply to every training stage (CPT / SFT / DPO) and are what make a multi-day
+single-GPU run survivable. Controlled by `save_steps` in each config.
+
+**What gets saved:** every `save_steps` optimizer steps the trainer writes
+`<output_dir>/checkpoint-<step>/` containing the **LoRA adapter weights** plus the
+**optimizer, LR-scheduler, RNG, and trainer state** (`trainer_state.json`) — everything
+needed to resume bit-exactly. Because only the adapter is saved (not the frozen 4-bit/bf16
+base), each checkpoint is small (~hundreds of MB to a couple GB), not the full model. When
+training completes, the final adapter is written to `<output_dir>/` itself; `--merge` then
+folds it into `<output_dir>/merged/`.
+
+**Why checkpoint frequently:** a single-GPU CPT can run *days*, and an SSH drop, OOM, power
+blip, or NaN loss otherwise loses everything. `save_steps: 500` caps the worst-case loss at
+≤500 steps of work. Always launch long runs under **`tmux`/`nohup`** so a disconnected shell
+doesn't kill the process, and treat the checkpoints as your rollback points.
+
+**Resuming:** the checkpoint holds optimizer + scheduler + RNG state, so resuming continues
+the *exact* LR curve and data order — not a fresh restart. The training scripts currently
+call `trainer.train()` with no resume flag; to resume, pass the checkpoint path:
+```python
+trainer.train(resume_from_checkpoint="models/cpt/checkpoint-2000")
+```
+Resume is only valid if the config is unchanged (batch, LR, schedule, data) — the scheduler
+state assumes the same total-step horizon it was created with.
+
+**Watch disk — checkpoints are NOT auto-pruned:** the configs don't set `save_total_limit`,
+so *every* checkpoint is retained (at `save_steps: 200`, SFT produces dozens). Add
+`save_total_limit: 3` to the config to keep only the most recent N and delete older ones,
+or prune `checkpoint-*` dirs manually.
+
+**Stopping early — set `max_steps`, don't Ctrl-C mid-cosine:** the cosine scheduler anneals
+the LR toward ~0 over its full horizon, and that final low-LR annealing is where a lot of
+the settling happens. If you decide up front to run fewer steps, set `max_steps: N` in the
+config so the anneal *completes* over N steps (a clean checkpoint). Killing a longer run
+partway leaves the LR only partly decayed — a mid-schedule, under-annealed checkpoint that
+is measurably worse than a run properly scheduled for N. (`max_steps` overrides
+`num_train_epochs`; note one epoch of the CPT mix is a fixed step count the trainer prints
+as `Total optimization steps` at startup.)
+
+**Evaluate a checkpoint without stopping the run:** because each checkpoint is a
+self-contained adapter, you can point the evaluator at one mid-run while training continues —
+`run_eval.py --peft models/cpt/checkpoint-2000 --base-model <base>` — to test an intermediate
+model and decide whether the remaining steps are worth it.
+
+---
+
 ### Step 6 — Continued Pretraining (CPT)
 
 **What it does:** Trains the model on raw Polish text (web corpora, Wikipedia, legal acts, GUS statistics) plus English replay using next-token prediction on packed sequences. Produces a Polish-fluent model that still follows instructions. This is the most compute-intensive stage.
