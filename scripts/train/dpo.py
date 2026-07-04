@@ -22,6 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
     load_config, load_model_and_tokenizer, load_for_merge, merge_and_save, wandb_report_to,
+    make_training_callbacks,
 )
 
 
@@ -97,6 +98,7 @@ def main() -> int:
         eval_strategy="steps" if eval_ds else "no",
         seed=cfg.get("seed", 3407),
         report_to=wandb_report_to(),
+        save_total_limit=cfg.get("save_total_limit", 3),
     )
     trainer = DPOTrainer(
         model=loaded.model,
@@ -105,6 +107,7 @@ def main() -> int:
         train_dataset=train_ds,
         eval_dataset=eval_ds,
         processing_class=loaded.tokenizer,
+        callbacks=make_training_callbacks(cfg),
     )
     trainer.train()
     trainer.save_model(cfg["output_dir"])

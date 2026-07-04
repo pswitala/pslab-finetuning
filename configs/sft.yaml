@@ -45,6 +45,12 @@ output_dir: models/sft
 save_steps: 200
 eval_steps: 200
 logging_steps: 20
+save_total_limit: 3        # keep only the last N checkpoints; prune the rest
+# Stability guard (abort on NaN loss / grad_norm spikes). See configs/cpt.yaml for details.
+# Env overrides: PSLAB_STABILITY_GUARD=0|1  PSLAB_MAX_GRAD_NORM_ABORT  PSLAB_STABILITY_PATIENCE
+stability_guard: true
+max_grad_norm_abort: 100.0
+stability_patience: 3
 seed: 3407
 
 per_device_train_batch_size: 2     # PILOT — restore to 4 for full run

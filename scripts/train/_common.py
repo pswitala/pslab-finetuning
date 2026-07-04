@@ -38,6 +38,80 @@ def wandb_report_to() -> list[str]:
     return ["wandb"] if os.environ.get("WANDB_API_KEY") else []
 
 
+def make_training_callbacks(cfg: dict) -> list:
+    """Trainer callbacks that abort a diverging run early (shared by cpt/sft/dpo).
+
+    A too-high LR (or a bad batch) shows up as exploding grad_norm and rising/NaN loss. Left
+    alone, a multi-day run keeps burning hours going nowhere. StabilityGuard watches the
+    per-step training log and calls `control.should_training_stop` on NaN loss or after
+    `patience` consecutive grad_norm spikes — so it stops in a handful of logging steps, and
+    the periodic checkpoints (save_steps) remain your rollback points to the best step.
+
+    Steered by config keys, each overridable by an env var (env wins) so a run can be tuned
+    without editing YAML:
+        stability_guard: true|false      env PSLAB_STABILITY_GUARD = 0/1
+        max_grad_norm_abort: 100.0       env PSLAB_MAX_GRAD_NORM_ABORT   (pre-clip norm)
+        stability_patience: 3            env PSLAB_STABILITY_PATIENCE    (consecutive spikes)
+    """
+    import os
+    from transformers import TrainerCallback
+
+    enabled = bool(cfg.get("stability_guard", True))
+    flag = os.environ.get("PSLAB_STABILITY_GUARD")
+    if flag in ("0", "false", "False"):
+        enabled = False
+    elif flag in ("1", "true", "True"):
+        enabled = True
+    if not enabled:
+        print("[_common] stability guard disabled")
+        return []
+
+    max_gn = float(os.environ.get("PSLAB_MAX_GRAD_NORM_ABORT")
+                   or cfg.get("max_grad_norm_abort", 100.0))
+    patience = int(os.environ.get("PSLAB_STABILITY_PATIENCE")
+                   or cfg.get("stability_patience", 3))
+
+    class StabilityGuard(TrainerCallback):
+        def __init__(self, max_grad_norm: float, patience: int):
+            self.max_grad_norm = max_grad_norm
+            self.patience = patience
+            self.bad = 0
+
+        @staticmethod
+        def _num(v):
+            try:
+                return float(v)            # logs may carry floats or preformatted strings
+            except (TypeError, ValueError):
+                return None
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if not logs:
+                return
+            loss = self._num(logs.get("loss"))
+            grad_norm = self._num(logs.get("grad_norm"))
+            if loss is not None and loss != loss:  # NaN
+                print(f"[stability-guard] NaN loss at step {state.global_step} — stopping. "
+                      "Lower learning_rate and resume from the last good checkpoint.")
+                control.should_training_stop = True
+                return
+            if grad_norm is not None and grad_norm > self.max_grad_norm:
+                self.bad += 1
+                print(f"[stability-guard] grad_norm {grad_norm:.1f} > {self.max_grad_norm} "
+                      f"at step {state.global_step} ({self.bad}/{self.patience} spikes)")
+                if self.bad >= self.patience:
+                    print("[stability-guard] repeated grad-norm spikes — stopping. Lower "
+                          "learning_rate (or raise warmup) and resume from the best checkpoint.")
+                    control.should_training_stop = True
+            else:
+                # Decay (not hard-reset): a lone transient spike is forgiven, but intermittent
+                # spikes that keep recurring — as in a diverging warmup ramp — still accumulate.
+                self.bad = max(0, self.bad - 1)
+
+    print(f"[_common] stability guard on: abort on NaN loss or {patience} consecutive "
+          f"grad_norm spikes > {max_gn}")
+    return [StabilityGuard(max_gn, patience)]
+
+
 # Attention projection patterns. Fused-QKV variants (Phi-3, MPT, Falcon, GPT-2) are
 # listed alongside the split variant; _resolve_target_modules picks the pattern with the
 # MOST matches, so an arch that has both `o_proj` and `qkv_proj` (Phi-3) correctly

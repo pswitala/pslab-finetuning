@@ -24,6 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
     load_config, load_model_and_tokenizer, load_for_merge, merge_and_save, wandb_report_to,
+    make_training_callbacks,
 )
 
 
@@ -150,9 +151,11 @@ def main() -> int:
         eval_strategy="steps" if eval_ds else "no",
         seed=cfg.get("seed", 3407),
         report_to=wandb_report_to(),
+        save_total_limit=cfg.get("save_total_limit", 3),
     )
     trainer = SFTTrainer(model=loaded.model, processing_class=loaded.tokenizer,
-                         train_dataset=train_ds, eval_dataset=eval_ds, args=sft_cfg)
+                         train_dataset=train_ds, eval_dataset=eval_ds, args=sft_cfg,
+                         callbacks=make_training_callbacks(cfg))
 
     # Train on responses only: mask prompt tokens in the loss.
     # Separator tokens are read from config (instruction_part / response_part).

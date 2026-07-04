@@ -539,12 +539,33 @@ trainer.train(resume_from_checkpoint="models/cpt/checkpoint-2000")
 Resume is only valid if the config is unchanged (batch, LR, schedule, data) — the scheduler
 state assumes the same total-step horizon it was created with.
 
-**Watch disk — checkpoints are NOT auto-pruned:** the configs don't set `save_total_limit`,
-so *every* checkpoint is retained (at `save_steps: 200`, SFT produces dozens). Add
-`save_total_limit: 3` to the config to keep only the most recent N and delete older ones,
-or prune `checkpoint-*` dirs manually.
+**Disk — checkpoints are pruned to `save_total_limit`:** the configs set `save_total_limit: 3`,
+so only the most recent 3 `checkpoint-*` dirs are kept and older ones are deleted automatically
+(raise it if you want more rollback points, at the cost of disk).
 
-**Stopping early — set `max_steps`, don't Ctrl-C mid-cosine:** the cosine scheduler anneals
+**Automatic early-abort on instability (`stability_guard`):** a too-high LR (or a bad batch)
+shows up as exploding `grad_norm` and rising/NaN loss — left alone, a multi-day run keeps
+burning hours going nowhere. All three trainers attach a `StabilityGuard` callback
+(`scripts/train/_common.py`) that watches the per-step training log and **stops the run** on
+NaN loss or after `stability_patience` consecutive `grad_norm` spikes above
+`max_grad_norm_abort`. It fires at `logging_steps` cadence, so a diverging run halts in a
+handful of steps (~seconds–minutes) instead of hours, and your `save_total_limit` checkpoints
+remain the rollback points — resume from the last good one after lowering the LR. Config keys
+(each overridable by an env var, env wins — steer a run without editing YAML):
+
+| Config key | Default | Env override |
+|---|---|---|
+| `stability_guard` | `true` | `PSLAB_STABILITY_GUARD=0` / `1` |
+| `max_grad_norm_abort` | `100.0` | `PSLAB_MAX_GRAD_NORM_ABORT=<float>` |
+| `stability_patience` | `3` | `PSLAB_STABILITY_PATIENCE=<int>` |
+
+```bash
+# e.g. run a jittery config on a tighter leash without touching the YAML:
+PSLAB_MAX_GRAD_NORM_ABORT=50 PSLAB_STABILITY_PATIENCE=2 python scripts/train/cpt.py --config configs/cpt.yaml
+```
+(This is distinct from TRL's `max_grad_norm` gradient *clipping*, which bounds each step but never stops the run. The guard is a *circuit breaker*; note the guard reads the **pre-clip** `grad_norm` the trainer logs.)
+
+**Stopping early on purpose — set `max_steps`, don't Ctrl-C mid-cosine:** the cosine scheduler anneals
 the LR toward ~0 over its full horizon, and that final low-LR annealing is where a lot of
 the settling happens. If you decide up front to run fewer steps, set `max_steps: N` in the
 config so the anneal *completes* over N steps (a clean checkpoint). Killing a longer run

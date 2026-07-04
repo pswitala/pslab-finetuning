@@ -55,6 +55,15 @@ output_dir: models/cpt
 save_steps: 500
 eval_steps: 2000
 logging_steps: 20
+save_total_limit: 3        # keep only the last N checkpoints (best rollback points); prune the rest
+
+# Stability guard — aborts the run on NaN loss or repeated grad_norm spikes so a diverging
+# run (e.g. LR too high) stops in a few logging steps instead of burning hours. Steered by
+# these keys, each overridable by an env var (env wins) without editing YAML:
+#   PSLAB_STABILITY_GUARD=0|1   PSLAB_MAX_GRAD_NORM_ABORT=<float>   PSLAB_STABILITY_PATIENCE=<int>
+stability_guard: true
+max_grad_norm_abort: 100.0   # pre-clip grad_norm above this counts as a spike
+stability_patience: 3        # consecutive spikes (at logging_steps cadence) before aborting
 # english_retention_check: run a small EN benchmark during CPT to detect catastrophic
 # forgetting. NOT yet wired into cpt.py — retention is currently measured out-of-band via
 # scripts/eval/run_eval.py --suite english. Left commented until implemented.
