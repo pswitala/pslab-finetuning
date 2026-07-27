@@ -46,3 +46,12 @@ stability_guard: true
 max_grad_norm_abort: 100.0
 stability_patience: 3
 seed: 3407
+
+# Multi-GPU — see configs/cpt.yaml for the full explanation of each key.
+# Only consulted under torchrun / accelerate launch (`make dpo NPROC=4`).
+distributed:
+  effective_batch: constant          # constant | scale
+  ddp_find_unused_parameters: false
+  dataloader_num_workers: 4
+  ddp_timeout: 5400
+  device_map: auto

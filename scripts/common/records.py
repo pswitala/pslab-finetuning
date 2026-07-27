@@ -26,6 +26,24 @@ COMMERCIAL_SAFE_PREFIXES = (
 )
 
 
+def load_exclude_ids(path) -> set[str]:
+    """Load a holdout id manifest (one id per line) into a set.
+
+    Used by the SFT/CPT builders to exclude eval-holdout records by id, so a held-out
+    catalog fact can never leak into training regardless of input file paths. Returns an
+    empty set for a falsy path (feature off).
+    """
+    if not path:
+        return set()
+    ids: set[str] = set()
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                ids.add(line)
+    return ids
+
+
 def normalize_license(raw) -> str:
     """Lowercase + collapse spaces to hyphens; empty/None -> 'unknown'."""
     if not raw:

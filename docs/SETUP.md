@@ -1,7 +1,11 @@
 # Setup — Ubuntu, RTX 6000 Pro Blackwell (96 GB)
 
-Target: **Ubuntu**, single **NVIDIA RTX 6000 Pro Blackwell**, compute capability
-`sm_120`, CUDA 12.9, running inside the **`vllm` virtualenv**.
+Target: **Ubuntu**, 4× **NVIDIA RTX 6000 Pro Blackwell** (96 GB each, PCIe, no NVLink),
+compute capability `sm_120`, CUDA 12.9, running inside the **`vllm` virtualenv**.
+
+Everything runs on a single card; multi-GPU is opt-in per run (`make cpt NPROC=4`). Ubuntu is
+required for multi-GPU specifically — **NCCL has no Windows build**, so a native Windows
+checkout is single-GPU only.
 
 ---
 
@@ -181,4 +185,8 @@ Both should complete without errors.
 | `datatrove` import error | `pip install datatrove --upgrade` |
 | `datasets` not found | `pip install datasets pyarrow` (not in the vllm venv by default) |
 | OOM during training | Reduce `per_device_train_batch_size` to 1 in the config |
+| Multi-GPU run hangs before step 1 | Peer-to-peer over PCIe. Check `nvidia-smi topo -m`, then retry with `NCCL_P2P_DISABLE=1`; `NCCL_DEBUG=INFO` for detail |
+| DDP: "expected to have finished reduction in the prior iteration" | Unused parameters. Set `distributed.ddp_find_unused_parameters: true` in the stage config as a workaround, and check that the vision tower is being frozen (`[_common] frozen N vision adapter parameters`) |
+| Multi-GPU OOMs where 1 GPU did not | `use_reentrant: False` gradient checkpointing (required for DDP) raises peak memory. Reduce `per_device_train_batch_size` |
+| `--merge` exits with "must run as a single process" | Working as intended — use `make cpt-merge`, not `make cpt-merge NPROC=4` |
 | `target_modules not found` PEFT error | `python3 -c "from transformers import AutoModelForCausalLM; m = AutoModelForCausalLM.from_pretrained('...', load_in_4bit=True, trust_remote_code=True); print([n for n,_ in m.named_modules()])"` |

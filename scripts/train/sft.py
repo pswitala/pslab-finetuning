@@ -10,8 +10,10 @@ Input format: jsonl with either
   or {"instruction": ..., "input": ..., "output": ...}        (converted to messages)
 
 Usage:
-    python scripts/train/sft.py --config configs/sft.yaml
-    python scripts/train/sft.py --config configs/sft.yaml --merge
+    python scripts/train/sft.py --config configs/sft.yaml           # single GPU
+    torchrun --standalone --nproc_per_node=4 \
+        scripts/train/sft.py --config configs/sft.yaml              # 4-way DDP
+    python scripts/train/sft.py --config configs/sft.yaml --merge   # single process only
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
     load_config, load_model_and_tokenizer, load_for_merge, merge_and_save, wandb_report_to,
-    make_training_callbacks,
+    make_training_callbacks, render_prompt_completion, distributed_training_args, rank0_print,
 )
 
 
@@ -38,34 +40,17 @@ def _to_messages(ex: dict) -> dict:
                          {"role": "assistant", "content": ex.get("output", "")}]}
 
 
-def _render_chat(tokenizer, messages, tools, enable_thinking: bool) -> str:
-    """Render one conversation to text, passing `tools` when present.
-
-    enable_thinking=False suppresses <think> blocks in the labels (instruct models
-    generate them by default). Progressively drops kwargs the tokenizer doesn't accept:
-    enable_thinking first (older tokenizers), then tools (non-tool-capable templates).
-    """
-    kwargs = {"tokenize": False, "add_generation_prompt": False}
-    if tools:
-        kwargs["tools"] = tools
-    try:
-        return tokenizer.apply_chat_template(
-            messages, enable_thinking=enable_thinking, **kwargs)
-    except TypeError:
-        try:
-            return tokenizer.apply_chat_template(messages, **kwargs)
-        except TypeError:
-            kwargs.pop("tools", None)   # template predates tool support
-            return tokenizer.apply_chat_template(messages, **kwargs)
-
-
 def load_chat_dataset(files_glob: str, tokenizer, enable_thinking: bool = False):
-    """Read chat/tool-use jsonl and render to a flat {'text': ...} dataset.
+    """Read chat/tool-use jsonl and render to a flat {'prompt','completion'} dataset.
 
     Records are read + rendered in Python (not via load_dataset's arrow inference) so the
     deeply-nested, heterogeneous `messages`/`tools`/`tool_calls.arguments` structures —
     which arrow cannot unify across plain-chat and tool-use rows — never reach a columnar
-    schema. Only the final flat `text` column is materialized.
+    schema. Only the two flat string columns are materialized.
+
+    The prompt/completion split lets TRL's `completion_only_loss` mask the prompt so loss is
+    computed on the assistant response only — on BOTH the PEFT and Unsloth paths (the old
+    Unsloth-only masking silently trained on the full prompt whenever the PEFT fallback ran).
     """
     import json as _json
     from datasets import Dataset
@@ -90,15 +75,19 @@ def load_chat_dataset(files_glob: str, tokenizer, enable_thinking: bool = False)
                 if "messages" not in ex:
                     continue
                 tools = ex.get("tools")
+                rendered = render_prompt_completion(
+                    tokenizer, ex["messages"], tools, enable_thinking)
+                if rendered is None:
+                    continue   # no assistant turn to learn from
                 if tools:
                     n_tool += 1
-                rows.append({"text": _render_chat(
-                    tokenizer, ex["messages"], tools, enable_thinking)})
+                prompt, completion = rendered
+                rows.append({"prompt": prompt, "completion": completion})
 
     if not rows:
         raise FileNotFoundError(f"no usable records in {files_glob}")
-    print(f"[sft] loaded {len(rows):,} examples ({n_tool:,} tool-use) from "
-          f"{len(paths)} file(s)")
+    rank0_print(f"[sft] loaded {len(rows):,} examples ({n_tool:,} tool-use) from "
+                f"{len(paths)} file(s)")
     return Dataset.from_list(rows)
 
 
@@ -115,22 +104,31 @@ def main() -> int:
         return 0
 
     loaded = load_model_and_tokenizer(cfg)
-    print(f"[sft] backend={loaded.backend} base={cfg['base_model']}")
+    rank0_print(f"[sft] backend={loaded.backend} base={cfg['base_model']}")
 
+    from accelerate import PartialState
     from trl import SFTTrainer, SFTConfig
 
+    # Rendering is a pure-Python pass over the jsonl, so every rank pays for it regardless;
+    # serializing behind rank 0 keeps four processes off the same files at once. No-op
+    # single-process.
     enable_thinking = cfg.get("enable_thinking", False)
-    train_ds = load_chat_dataset(cfg["train_files"], loaded.tokenizer, enable_thinking)
-    eval_ds = None
-    if cfg.get("eval_files"):
-        try:
-            eval_ds = load_chat_dataset(cfg["eval_files"], loaded.tokenizer, enable_thinking)
-        except FileNotFoundError:
-            pass
+    with PartialState().local_main_process_first():
+        train_ds = load_chat_dataset(cfg["train_files"], loaded.tokenizer, enable_thinking)
+        eval_ds = None
+        if cfg.get("eval_files"):
+            try:
+                eval_ds = load_chat_dataset(cfg["eval_files"], loaded.tokenizer, enable_thinking)
+            except FileNotFoundError:
+                pass
 
+    # completion_only_loss masks the prompt so loss is computed on the assistant response
+    # only (train_on_responses_only in the config). Works on both PEFT and Unsloth paths
+    # via TRL, replacing the removed DataCollatorForCompletionOnlyLM / Unsloth-only masking.
+    completion_only = cfg.get("train_on_responses_only", True)
     sft_cfg = SFTConfig(
         output_dir=cfg["output_dir"],
-        dataset_text_field="text",
+        completion_only_loss=completion_only,
         max_length=cfg.get("max_seq_len", 4096),
         packing=cfg.get("packing", False),
         per_device_train_batch_size=cfg.get("per_device_train_batch_size", 8),
@@ -138,7 +136,8 @@ def main() -> int:
         # full-sequence logits (batch × seq × vocab, fp32); large vocabularies OOM otherwise.
         per_device_eval_batch_size=cfg.get(
             "per_device_eval_batch_size", cfg.get("per_device_train_batch_size", 1)),
-        gradient_accumulation_steps=cfg.get("gradient_accumulation_steps", 4),
+        # gradient_accumulation_steps + DDP knobs; world-size aware (see configs' distributed:)
+        **distributed_training_args(cfg, default_grad_accum=4),
         learning_rate=float(cfg.get("learning_rate", 2e-4)),
         lr_scheduler_type=cfg.get("lr_scheduler", "cosine"),
         warmup_ratio=cfg.get("warmup_ratio", 0.03),
@@ -157,32 +156,12 @@ def main() -> int:
                          train_dataset=train_ds, eval_dataset=eval_ds, args=sft_cfg,
                          callbacks=make_training_callbacks(cfg))
 
-    # Train on responses only: mask prompt tokens in the loss.
-    # Separator tokens are read from config (instruction_part / response_part).
-    if cfg.get("train_on_responses_only", True) and loaded.backend == "unsloth":
-        instruction_part = cfg.get("instruction_part", "<|im_start|>user\n")
-        response_part = cfg.get("response_part", "<|im_start|>assistant\n")
-        try:
-            from unsloth.chat_templates import train_on_responses_only
-            trainer = train_on_responses_only(
-                trainer,
-                instruction_part=instruction_part,
-                response_part=response_part,
-            )
-        except Exception as exc:  # noqa: BLE001
-            print(f"[sft] train_on_responses_only (Unsloth) skipped: {exc}")
-            # PEFT fallback: TRL DataCollatorForCompletionOnlyLM handles masking.
-            try:
-                from trl import DataCollatorForCompletionOnlyLM
-                collator = DataCollatorForCompletionOnlyLM(
-                    response_part, tokenizer=loaded.tokenizer)
-                trainer.data_collator = collator
-            except Exception as exc2:  # noqa: BLE001
-                print(f"[sft] DataCollatorForCompletionOnlyLM also skipped: {exc2}")
+    if completion_only:
+        rank0_print("[sft] completion_only_loss=True — loss computed on assistant responses only")
 
     trainer.train()
     trainer.save_model(cfg["output_dir"])
-    print(f"[sft] done -> {cfg['output_dir']}")
+    rank0_print(f"[sft] done -> {cfg['output_dir']}")
     return 0
 
 

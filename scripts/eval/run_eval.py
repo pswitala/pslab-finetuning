@@ -65,6 +65,13 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=0, help="0 = full; >0 = quick subset")
     ap.add_argument("--backend", choices=["hf", "vllm"], default="hf",
                     help="lm-eval inference backend: hf (default) or vllm")
+    ap.add_argument("--gpus", type=int, default=1,
+                    help="data-parallel workers. vllm: data_parallel_size=N. hf: runs under "
+                         "accelerate launch --num_processes N. Independent replicas, no "
+                         "inter-GPU traffic — the right axis on a PCIe rig with no NVLink")
+    ap.add_argument("--tp-size", type=int, default=1,
+                    help="vllm tensor_parallel_size. Only needed when the model does not fit "
+                         "on one card; splitting a fitting model costs PCIe all-reduces")
     args = ap.parse_args()
 
     tasks = ",".join(TASKS[args.suite])
@@ -89,8 +96,12 @@ def main() -> int:
         model_args = f"pretrained={args.model},dtype=bfloat16"
 
     if args.backend == "vllm":
-        # tensor_parallel_size=1 prevents vllm from attempting multi-GPU sharding
-        vllm_args = f"pretrained={args.model},dtype=bfloat16,tensor_parallel_size=1"
+        # tensor_parallel_size splits one model across GPUs (defaults to 1 — no sharding);
+        # data_parallel_size runs N independent replicas over disjoint slices of the task,
+        # which is what actually scales throughput here.
+        vllm_args = (f"pretrained={args.model},dtype=bfloat16,"
+                     f"tensor_parallel_size={args.tp_size},"
+                     f"data_parallel_size={args.gpus}")
         cmd = [
             "lm-eval", "--model", "vllm",
             "--model_args", vllm_args,
@@ -99,8 +110,13 @@ def main() -> int:
             "--output_path", str(out_dir),
         ]
     else:
-        cmd = [
-            "lm-eval", "--model", "hf",
+        # lm-eval's hf backend is data-parallel when launched under accelerate: each process
+        # takes its own slice and the harness gathers the results. accelerate launch needs a
+        # module (-m lm_eval), not the lm-eval console script.
+        prefix = (["accelerate", "launch", "--num_processes", str(args.gpus), "-m", "lm_eval"]
+                  if args.gpus > 1 else ["lm-eval"])
+        cmd = prefix + [
+            "--model", "hf",
             "--model_args", model_args,
             "--tasks", tasks,
             "--batch_size", str(args.batch_size),

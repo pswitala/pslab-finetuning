@@ -42,6 +42,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from common.records import load_exclude_ids  # noqa: E402
 from common.tool_catalog import ALL_TOOLS, tool_for_source  # noqa: E402
 from common.tooling import make_tool_sample, validate_sample  # noqa: E402
 
@@ -219,19 +220,29 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--mode", choices=["template", "agentic", "llm"], default="template")
     ap.add_argument("--per-record", type=int, default=2)
+    ap.add_argument("--exclude-ids", default=None,
+                    help="path to a holdout id manifest (from make_holdout.py); records "
+                         "whose id is listed are skipped to prevent eval-holdout leakage")
     args = ap.parse_args()
 
     gen = {"template": template_pairs, "agentic": agentic_pairs,
            "llm": llm_pairs}[args.mode]
+    exclude_ids = load_exclude_ids(args.exclude_ids)
+    if exclude_ids:
+        print(f"[build_sft_qa] excluding {len(exclude_ids)} holdout ids")
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    n = 0
+    n = n_excluded = 0
     with out_path.open("w", encoding="utf-8") as out:
         for rec in iter_jsonl(args.input):
+            if exclude_ids and rec.get("id") in exclude_ids:
+                n_excluded += 1
+                continue
             for pair in gen(rec, args.per_record):
                 out.write(json.dumps(pair, ensure_ascii=False) + "\n")
                 n += 1
-    print(f"wrote {n} SFT QA pairs -> {out_path}")
+    print(f"wrote {n} SFT QA pairs -> {out_path} "
+          f"(excluded {n_excluded} holdout records)")
     return 0
 
 

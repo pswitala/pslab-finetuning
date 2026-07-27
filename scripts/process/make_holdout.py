@@ -7,12 +7,20 @@ record to train or holdout by a STABLE hash of its id, so:
   - the split is reproducible (same seed -> same split), and
   - a given record can never leak between the two sets across re-runs.
 
+The holdout dir MUST live outside the `data/catalogs/**` glob that the SFT/CPT builders
+read (otherwise held-out records leak back into training). It is written under
+`data/holdout/` and an id manifest (`ids.txt`) is emitted so the builders can exclude
+those ids by id, independent of file paths (see build_sft_qa.py / build_cpt_mix.py
+--exclude-ids).
+
 Usage:
     python scripts/process/make_holdout.py \
         --input "data/catalogs/**/*.jsonl" \
         --train-out data/catalogs_train \
-        --holdout-out data/catalogs/_holdout \
+        --holdout-out data/holdout/catalog \
         --fraction 0.02
+    # then build SFT/CPT excluding the holdout ids:
+    #   build_sft_qa.py --exclude-ids data/holdout/catalog/ids.txt ...
 """
 
 from __future__ import annotations
@@ -56,8 +64,12 @@ def main() -> int:
     train_dir, hold_dir = Path(args.train_out), Path(args.holdout_out)
     train_dir.mkdir(parents=True, exist_ok=True)
     hold_dir.mkdir(parents=True, exist_ok=True)
+    if hold_dir.resolve() == train_dir.resolve():
+        raise SystemExit("--train-out and --holdout-out must be different directories")
     train_fh = (train_dir / "records.jsonl").open("w", encoding="utf-8")
     hold_fh = (hold_dir / "records.jsonl").open("w", encoding="utf-8")
+    # Manifest of held-out ids, so downstream builders exclude them by id (path-independent).
+    ids_fh = (hold_dir / "ids.txt").open("w", encoding="utf-8")
 
     n_train = n_hold = n_skip = 0
     try:
@@ -69,6 +81,7 @@ def main() -> int:
             line = json.dumps(rec, ensure_ascii=False) + "\n"
             if in_holdout(rec_id, args.fraction, args.seed):
                 hold_fh.write(line)
+                ids_fh.write(f"{rec_id}\n")
                 n_hold += 1
             else:
                 train_fh.write(line)
@@ -76,9 +89,10 @@ def main() -> int:
     finally:
         train_fh.close()
         hold_fh.close()
+        ids_fh.close()
 
     print(f"train={n_train} holdout={n_hold} skipped(no id)={n_skip}")
-    print(f"-> {train_dir}  |  {hold_dir}")
+    print(f"-> {train_dir}  |  {hold_dir} (+ ids.txt manifest)")
     return 0
 
 

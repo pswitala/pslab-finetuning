@@ -11,7 +11,8 @@ in `.env` to any HuggingFace model ID — the pipeline auto-detects LoRA target 
 silently mis-targeting) and freezes vision encoders only when present. See
 `configs/models/` for per-architecture presets (Llama-3, Phi-3, Mistral).
 
-**Hardware:** 1× NVIDIA RTX 6000 Pro Blackwell, 96 GB VRAM (single GPU, QLoRA).
+**Hardware:** 4× NVIDIA RTX 6000 Pro Blackwell, 96 GB VRAM each (QLoRA; runs on one card,
+scales to all four with DDP — see [Multi-GPU training](#multi-gpu-training)).
 
 ---
 
@@ -481,6 +482,12 @@ costs VRAM, `gradient_accumulation_steps` costs wall-clock time.** The rule of t
 `per_device_train_batch_size` until VRAM is nearly full, then use
 `gradient_accumulation_steps` to reach your target effective batch.
 
+`num_GPUs` is the third factor, and it is the one you get for free: adding GPUs multiplies
+the effective batch unless you compensate. By default the configs compensate for you —
+`distributed.effective_batch: constant` divides `gradient_accumulation_steps` by the world
+size so a 4-GPU run does exactly the same optimizer math as a 1-GPU run, four times faster.
+See [Multi-GPU training](#multi-gpu-training).
+
 | Knob | Scope | Larger → | Smaller → |
 |---|---|---|---|
 | **`per_device_train_batch_size`** | int ≥ 1 (VRAM-bound; ~1–2 for 27B @ seq 4096, more at seq 2048) | more VRAM used (activations scale ~linearly), better GPU utilization/throughput, less kernel-launch overhead — too high **OOMs** | less VRAM, OOM-safe, but underfeeds the GPU (worse utilization). `1` is the memory floor |
@@ -512,10 +519,73 @@ costs VRAM, `gradient_accumulation_steps` costs wall-clock time.** The rule of t
 
 ---
 
+### Multi-GPU training
+
+Append `NPROC=<n>` to any training target. `NPROC=1` (the default) is a plain single process
+and behaves exactly as before:
+
+```bash
+make cpt NPROC=4          # 4-way DDP
+make sft NPROC=4
+make dpo NPROC=4
+make cpt-merge            # merge is always single-process
+```
+
+Under the hood this is `torchrun --standalone --nproc_per_node=4`; `accelerate launch
+--num_processes 4` works identically (both export `RANK`/`LOCAL_RANK`/`WORLD_SIZE`, which is
+all the scripts key off).
+
+**Why DDP and not FSDP/DeepSpeed.** The 4-bit 27B is ~14 GB, so a full replica fits on one
+96 GB card with room to spare — there is nothing to gain from sharding the model. That matters
+here because **the RTX 6000 Pro Blackwell has no NVLink**: every byte between GPUs crosses
+PCIe. DDP all-reduces only the LoRA gradients (tens of MB at r=64), which PCIe absorbs easily.
+FSDP or ZeRO-3 would move whole layers each step and be badly bottlenecked.
+
+**Effective batch.** Controlled by `distributed.effective_batch` in each config:
+
+| Value | Behaviour |
+|---|---|
+| `constant` (default) | `gradient_accumulation_steps` is divided by the world size, so `per_device × grad_accum × num_GPUs` matches the single-GPU run exactly. Identical optimizer math, ~N× faster. No LR retuning. |
+| `scale` | `gradient_accumulation_steps` is used as-is; the effective batch grows N×. Fewer optimizer steps over the same data — **retune `learning_rate` and `warmup_ratio`**. |
+
+Project the step count for a given world size with
+`python scripts/train/count_steps.py --config configs/cpt.yaml --num-gpus 4` — it applies the
+same policy, so under `constant` the effective batch is unchanged and only the step count
+drops.
+
+**Other `distributed:` keys:** `ddp_find_unused_parameters` (leave `false`; set `true` only if
+DDP reports unused parameters), `dataloader_num_workers` (per rank), `ddp_timeout` (raised to
+5400 s because a cold 27B load can outlast the 1800 s NCCL default), and `device_map` (used
+only for single-process runs, where `auto` still spreads one model across all visible cards).
+
+**Prerequisites and gotchas:**
+
+- Run `python scripts/check_env.py --min-gpus 4` first. It checks every card individually and
+  reports NCCL availability.
+- **NCCL is Linux-only.** Multi-GPU training must run on the Ubuntu box (or WSL2), not on a
+  native Windows checkout.
+- If NCCL hangs at initialization, inspect the topology with `nvidia-smi topo -m` and try
+  `NCCL_P2P_DISABLE=1` — peer-to-peer over PCIe is the usual culprit on NVLink-less rigs.
+- `--merge` refuses to run under a launcher: every rank would load the bf16 base and write the
+  same `merged/` directory. Use the `*-merge` targets, which always use plain `python`.
+- Only rank 0 prints. If you see four copies of every log line, the rank guard is not working.
+
+**Eval** is data-parallel rather than tensor-parallel, for the same PCIe reason:
+
+```bash
+make eval-parallel EVAL_GPUS=4    # 4 single-GPU workers over disjoint slices, then merge
+python scripts/eval/run_eval.py --model models/dpo/merged --suite polish --gpus 4
+```
+
+`--tp-size` is available on all three eval scripts but is only worth using when a model does
+not fit on one card.
+
+---
+
 ### Checkpointing — saving, resuming, and stopping safely
 
 Checkpoints apply to every training stage (CPT / SFT / DPO) and are what make a multi-day
-single-GPU run survivable. Controlled by `save_steps` in each config.
+run survivable. Controlled by `save_steps` in each config.
 
 **What gets saved:** every `save_steps` optimizer steps the trainer writes
 `<output_dir>/checkpoint-<step>/` containing the **LoRA adapter weights** plus the
@@ -525,7 +595,8 @@ base), each checkpoint is small (~hundreds of MB to a couple GB), not the full m
 training completes, the final adapter is written to `<output_dir>/` itself; `--merge` then
 folds it into `<output_dir>/merged/`.
 
-**Why checkpoint frequently:** a single-GPU CPT can run *days*, and an SSH drop, OOM, power
+**Why checkpoint frequently:** CPT can run *days* (about two on four GPUs, over a week on
+one), and an SSH drop, OOM, power
 blip, or NaN loss otherwise loses everything. `save_steps: 500` caps the worst-case loss at
 ≤500 steps of work. Always launch long runs under **`tmux`/`nohup`** so a disconnected shell
 doesn't kill the process, and treat the checkpoints as your rollback points.
@@ -835,11 +906,13 @@ make cpt-merge     # → ...cpt.py --config configs/cpt.yaml --merge
 ```
 
 **Override the defaults** with `VAR=value` on the command line (`?=` vars: `PY`, `CPT_CFG`,
-`SFT_CFG`, `DPO_CFG`):
+`SFT_CFG`, `DPO_CFG`, `NPROC`, `EVAL_GPUS`):
 
 ```bash
 make cpt CPT_CFG=configs/cpt_gemma.yaml   # different config
 make cpt PY=python3.12                     # different interpreter
+make cpt NPROC=4                           # 4-way DDP (see Multi-GPU training)
+make eval-parallel EVAL_GPUS=4             # one eval worker per card
 ```
 
 **Targets, grouped** (intended order, top-to-bottom):
@@ -848,8 +921,8 @@ make cpt PY=python3.12                     # different interpreter
 |---|---|
 | dev | `env` · `test` · `lint` |
 | data | `ingest` · `process` · `dedup` · `build-cpt` · `build-sft` · `build-agentic` |
-| training | `cpt` / `cpt-merge` · `sft` / `sft-merge` · `dpo` / `dpo-merge` |
-| eval + export | `eval` · `eval-agentic` · `gguf` |
+| training | `cpt` / `cpt-merge` · `sft` / `sft-merge` · `dpo` / `dpo-merge` (add `NPROC=n`) |
+| eval + export | `eval` · `eval-parallel` · `eval-agentic` · `gguf` |
 
 > **⚠ The data targets are simplified and can lag the commands in Steps 1–4.** In particular
 > `build-cpt` uses the bare `*.jsonl` glob (misses the gzipped `*.jsonl.gz` dedup shards → drops

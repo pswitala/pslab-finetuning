@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 End-to-end QLoRA fine-tuning pipeline for Qwen3.6-27B targeting Polish language fluency and knowledge injection from Polish open-data catalogs. Knowledge is baked into model weights (no RAG). Final artifacts are GGUF-quantized models for llama.cpp/Ollama.
 
-Hardware target: NVIDIA RTX 6000 Pro Blackwell, 96 GB VRAM, CUDA 12.9, compute capability sm_120.
+Hardware target: 4× NVIDIA RTX 6000 Pro Blackwell, 96 GB VRAM each, CUDA 12.9, compute capability sm_120. No NVLink — the cards are PCIe-connected, which is why training scales via DDP (one full replica per card, only LoRA gradients all-reduced) rather than FSDP/DeepSpeed, and why eval fans out data-parallel rather than using tensor parallelism.
 
 ## Commands
 
@@ -39,6 +39,13 @@ python scripts/process/build_sft_qa.py  # → data/processed/sft/
 ```
 
 ### Training (each stage produces adapters, then merged weights)
+
+Multi-GPU: `make cpt NPROC=4` / `make sft NPROC=4` / `make dpo NPROC=4` run 4-way DDP via
+`torchrun`. `--merge` must stay single-process (it raises SystemExit under a launcher).
+The `distributed:` block in each config controls the effective-batch policy — `constant`
+(default) divides `gradient_accumulation_steps` by the world size so multi-GPU runs reproduce
+the single-GPU optimizer math.
+
 ```bash
 python scripts/train/cpt.py --config configs/cpt.yaml          # Stage 1: CPT
 python scripts/train/cpt.py --config configs/cpt.yaml --merge  # Merge → models/cpt/merged/
@@ -115,8 +122,14 @@ export_gguf.py → models/gguf/*.gguf (Q4_K_M, Q5_K_M, Q8_0, f16)
 All training scripts import shared utilities:
 - `load_config(path)` — reads YAML configs
 - `LoadedModel` wrapper — tries Unsloth first, falls back to PEFT automatically
-- `make_lora_config()` — builds LoRA config targeting both SSM and attention layers
-- `freeze_vision_encoder()` — prevents vision parameters from training
+- `_resolve_target_modules()` — auto-detects LoRA targets across SSM and attention layers
+- `_maybe_freeze_vision_encoder()` — freezes vision parameters; called twice on the PEFT path
+  (before and after `get_peft_model`), because LoRA otherwise lands in the vision tower and
+  those adapters become DDP "unused parameters"
+- `dist_env()` / `is_main_process()` / `rank0_print()` — launcher-env helpers
+- `_resolve_device_map()` — `{"": local_rank}` under a launcher, `auto` single-process
+- `distributed_training_args()` — world-size-aware trainer kwargs (effective-batch policy,
+  DDP knobs); splatted into every stage's `SFTConfig`/`DPOConfig`
 
 ### Config System
 

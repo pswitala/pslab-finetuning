@@ -61,8 +61,10 @@ def main() -> int:
     ap.add_argument("--max-seq-len", type=int, default=None)
     ap.add_argument("--per-device-batch-size", type=int, default=None)
     ap.add_argument("--grad-accum", type=int, default=None)
-    ap.add_argument("--num-gpus", type=int, default=None,
-                    help="default: detected CUDA devices, else 1")
+    ap.add_argument("--num-gpus", type=int, default=1,
+                    help="world size the run will use, i.e. the NPROC/--nproc_per_node you "
+                         "will launch with (default 1). NOT auto-detected: visible cards "
+                         "only matter if you actually launch that many ranks")
     ap.add_argument("--epochs", type=float, default=None)
     ap.add_argument("--no-packing", action="store_true",
                     help="treat each example as one sequence (SFT/DPO style)")
@@ -81,13 +83,14 @@ def main() -> int:
     epochs = args.epochs if args.epochs is not None else cfg.get("num_train_epochs", 1)
     packing = cfg.get("packing", True) and not args.no_packing
 
-    num_gpus = args.num_gpus
-    if num_gpus is None:
-        try:
-            import torch
-            num_gpus = max(1, torch.cuda.device_count())
-        except Exception:  # noqa: BLE001
-            num_gpus = 1
+    num_gpus = max(1, args.num_gpus)
+    # Mirror distributed.effective_batch from the config (see _common.distributed_training_args):
+    # under "constant", grad_accum is divided by the world size at runtime so the effective
+    # batch is unchanged and only the step count drops. Modeling that here keeps the projected
+    # step count honest for a multi-GPU run.
+    policy = (cfg.get("distributed") or {}).get("effective_batch", "constant")
+    if num_gpus > 1 and policy == "constant" and grad_accum % num_gpus == 0:
+        grad_accum //= num_gpus
 
     train_glob = args.train_files or cfg["train_files"]
     print(f"[count_steps] loading dataset: {train_glob}")

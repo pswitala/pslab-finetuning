@@ -9,8 +9,9 @@ Scoring: lightweight string/number-overlap by default; plug an LLM judge for nua
 Compare the fine-tuned model against the base model (which should be near-zero on
 Polish-specific public data).
 
-Build a held-out set first (questions derived from records, with reference answers):
-    python scripts/process/build_sft_qa.py --input "data/catalogs/_holdout/**/*.jsonl" \
+Build a held-out set first (questions derived from records, with reference answers).
+The holdout lives OUTSIDE the data/catalogs/** training glob (see make_holdout.py):
+    python scripts/process/build_sft_qa.py --input "data/holdout/catalog/**/*.jsonl" \
         --out eval/data/catalog_qa_holdout.jsonl --mode template --per-record 1
 
 Then evaluate:
@@ -146,14 +147,18 @@ def _infer_hf(args, qa: list[dict]) -> list[str]:
 
     tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
 
+    # device_map="auto" pipeline-shards across every visible GPU. That is right for a model
+    # too big for one card, but for a sharded fan-out (--num-shards) each worker should be
+    # pinned to its own card — pass --device-map cuda:0 with CUDA_VISIBLE_DEVICES set.
+    device_map = getattr(args, "device_map", "auto")
     try:
         model = AutoModelForCausalLM.from_pretrained(
-            args.model, torch_dtype=torch.bfloat16, device_map="auto",
+            args.model, torch_dtype=torch.bfloat16, device_map=device_map,
             trust_remote_code=True)
     except Exception:  # noqa: BLE001
         from transformers import AutoModelForVision2Seq
         model = AutoModelForVision2Seq.from_pretrained(
-            args.model, torch_dtype=torch.bfloat16, device_map="auto",
+            args.model, torch_dtype=torch.bfloat16, device_map=device_map,
             trust_remote_code=True)
     model.eval()
 
@@ -175,11 +180,16 @@ def _infer_vllm(args, qa: list[dict]) -> list[str]:
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    # tensor_parallel_size splits one model across GPUs and all-reduces every layer. With no
+    # NVLink on this rig that traffic crosses PCIe, so it only pays off for a model too large
+    # for one card. For throughput on a model that fits, prefer --num-shards (independent
+    # single-GPU workers, no inter-GPU traffic) — see `make eval-parallel`.
     llm = LLM(
         model=args.model,
         dtype="bfloat16",
         trust_remote_code=True,
         max_model_len=4096,
+        tensor_parallel_size=args.tp_size,
     )
     params = SamplingParams(max_tokens=args.max_new_tokens, temperature=0.0)
 
@@ -227,12 +237,33 @@ def main() -> int:
                     help="judge model id for --scorer llm")
     ap.add_argument("--judge-base-url", default="",
                     help="OpenAI-compatible base URL for the judge (e.g. local vLLM)")
+    # --- multi-GPU ---
+    ap.add_argument("--tp-size", type=int, default=1,
+                    help="vLLM tensor_parallel_size. Only raise above 1 when the model does "
+                         "not fit on one card; on PCIe (no NVLink) --num-shards is faster")
+    ap.add_argument("--device-map", default="auto",
+                    help="hf backend placement: auto (shard over all GPUs) or e.g. cuda:0")
+    ap.add_argument("--num-shards", type=int, default=1,
+                    help="split the QA set across N independent workers (data parallel); "
+                         "each writes <out>/shardI — merge with scripts/eval/merge_shards.py")
+    ap.add_argument("--shard", type=int, default=0, help="which shard this worker handles")
     args = ap.parse_args()
+
+    if not 0 <= args.shard < args.num_shards:
+        ap.error(f"--shard must be in [0, {args.num_shards})")
 
     qa = load_qa(args.qa)
     if not qa:
         print("[catalog_eval] no QA items found; check --qa path")
         return 1
+
+    if args.num_shards > 1:
+        # Strided slice keeps shards balanced even when difficulty correlates with position.
+        qa = qa[args.shard::args.num_shards]
+        print(f"[catalog_eval] shard {args.shard}/{args.num_shards}: {len(qa)} items")
+        if not qa:
+            print("[catalog_eval] empty shard; nothing to do")
+            return 0
 
     if args.backend == "hf":
         answers = _infer_hf(args, qa)
@@ -265,6 +296,8 @@ def main() -> int:
         "threshold": args.threshold,
     }
     out_dir = Path(args.out)
+    if args.num_shards > 1:
+        out_dir = out_dir / f"shard{args.shard}"
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2))
     (out_dir / "details.jsonl").write_text(

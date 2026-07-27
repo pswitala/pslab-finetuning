@@ -71,6 +71,23 @@ stability_patience: 3        # consecutive spikes (at logging_steps cadence) bef
 
 seed: 3407
 
+# Multi-GPU. Only consulted under `torchrun --nproc_per_node=N` / `accelerate launch`
+# (i.e. `make cpt NPROC=4`); a plain `python scripts/train/cpt.py` ignores everything here
+# except device_map. Each rank holds a full NF4 replica on its own card (~14 GB of 96 GB)
+# and DDP all-reduces only the LoRA gradients — cheap over PCIe, which matters because the
+# RTX 6000 Pro Blackwell has no NVLink.
+distributed:
+  # constant — grad_accum is divided by world_size so the effective batch
+  #            (per_device x grad_accum x num_gpus) matches the single-GPU run exactly.
+  #            Identical optimization math, ~Nx faster wall clock, no LR retuning.
+  # scale    — grad_accum used as-is; effective batch grows Nx. Fewer optimizer steps over
+  #            the same data — retune learning_rate/warmup_ratio if you pick this.
+  effective_batch: constant
+  ddp_find_unused_parameters: false  # set true only if DDP reports unused parameters
+  dataloader_num_workers: 4          # per rank; 0 when single-process
+  ddp_timeout: 5400                  # s; a cold 27B load can exceed the 1800 default
+  device_map: auto                   # single-process placement only; ignored under a launcher
+
 #pilot run
 per_device_train_batch_size: 1
 gradient_accumulation_steps: 4    # was 32 → ~8× faster steps (~22 s/it)

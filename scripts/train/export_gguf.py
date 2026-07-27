@@ -56,6 +56,15 @@ def _resolve_model_dir(args) -> str:
     return model_dir
 
 
+def _unsloth_available() -> bool:
+    """True if Unsloth can be imported — used to resolve --backend auto."""
+    try:
+        import unsloth  # noqa: F401
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def export_unsloth(model_dir: str, quants: list[str], out_dir: str) -> None:
     try:
         from unsloth import FastLanguageModel
@@ -99,7 +108,10 @@ def main() -> int:
                     help="config whose output_dir holds the merged/ checkpoint to export")
     ap.add_argument("--model-dir", default=None,
                     help="explicit merged checkpoint dir (overrides --config)")
-    ap.add_argument("--backend", choices=["unsloth", "llamacpp"], default="unsloth")
+    ap.add_argument("--backend", choices=["auto", "unsloth", "llamacpp"], default="auto",
+                    help="auto (default): use Unsloth if importable, else llama.cpp. "
+                         "The project runs use_unsloth=false, so auto normally resolves to "
+                         "llamacpp (needs --llama-dir).")
     ap.add_argument("--quants", nargs="+",
                     default=["Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0"])
     ap.add_argument("--out", default="models/gguf")
@@ -109,7 +121,12 @@ def main() -> int:
     model_dir = _resolve_model_dir(args)
     print(f"[gguf] exporting merged checkpoint: {model_dir}")
 
-    if args.backend == "unsloth":
+    backend = args.backend
+    if backend == "auto":
+        backend = "unsloth" if _unsloth_available() else "llamacpp"
+        print(f"[gguf] --backend auto resolved to {backend}")
+
+    if backend == "unsloth":
         export_unsloth(model_dir, args.quants, args.out)
     else:
         export_llamacpp(model_dir, args.quants, args.out, args.llama_dir)

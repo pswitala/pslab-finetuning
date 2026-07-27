@@ -9,7 +9,7 @@ is far more meaningful than token overlap.
 Build a held-out set with the agentic builder (each line carries `messages`+`tools`, where
 the gold assistant turn contains the reference tool_call):
     python scripts/process/build_sft_qa.py \
-        --input "data/catalogs/_holdout/**/*.jsonl" \
+        --input "data/holdout/catalog/**/*.jsonl" \
         --out eval/data/agentic_holdout.jsonl --mode agentic --per-record 1
 
 Then evaluate (hf | vllm | gguf, same as catalog_eval):
@@ -156,14 +156,17 @@ def _infer_hf(args, qa: list[dict]) -> list[list[dict]]:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    # See catalog_eval._infer_hf: "auto" spreads one model over every visible GPU; pin with
+    # --device-map cuda:0 + CUDA_VISIBLE_DEVICES when fanning out with --num-shards.
+    device_map = getattr(args, "device_map", "auto")
     try:
         model = AutoModelForCausalLM.from_pretrained(
-            args.model, torch_dtype=torch.bfloat16, device_map="auto",
+            args.model, torch_dtype=torch.bfloat16, device_map=device_map,
             trust_remote_code=True)
     except Exception:  # noqa: BLE001
         from transformers import AutoModelForVision2Seq
         model = AutoModelForVision2Seq.from_pretrained(
-            args.model, torch_dtype=torch.bfloat16, device_map="auto",
+            args.model, torch_dtype=torch.bfloat16, device_map=device_map,
             trust_remote_code=True)
     model.eval()
 
@@ -185,8 +188,10 @@ def _infer_vllm(args, qa: list[dict]) -> list[list[dict]]:
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    # tensor_parallel_size > 1 all-reduces every layer over PCIe on this rig — only worth it
+    # when the model does not fit on one card. Prefer --num-shards for throughput.
     llm = LLM(model=args.model, dtype="bfloat16", trust_remote_code=True,
-              max_model_len=4096)
+              max_model_len=4096, tensor_parallel_size=args.tp_size)
     params = SamplingParams(max_tokens=args.max_new_tokens, temperature=0.0)
     prompts = [_prompt(tok, ex["q"], ex["tools"]) for ex in qa]
     outputs = llm.generate(prompts, params)
@@ -230,12 +235,31 @@ def main() -> int:
     ap.add_argument("--out", default="eval/results/agentic")
     ap.add_argument("--max-new-tokens", type=int, default=256)
     ap.add_argument("--backend", choices=["hf", "vllm", "gguf"], default="hf")
+    # --- multi-GPU (mirrors catalog_eval.py) ---
+    ap.add_argument("--tp-size", type=int, default=1,
+                    help="vLLM tensor_parallel_size; prefer --num-shards on PCIe rigs")
+    ap.add_argument("--device-map", default="auto",
+                    help="hf backend placement: auto (shard over all GPUs) or e.g. cuda:0")
+    ap.add_argument("--num-shards", type=int, default=1,
+                    help="split the QA set across N independent workers (data parallel); "
+                         "each writes <out>/shardI — merge with scripts/eval/merge_shards.py")
+    ap.add_argument("--shard", type=int, default=0, help="which shard this worker handles")
     args = ap.parse_args()
+
+    if not 0 <= args.shard < args.num_shards:
+        ap.error(f"--shard must be in [0, {args.num_shards})")
 
     qa = load_agentic(args.qa)
     if not qa:
         print("[agentic_eval] no tool-use items found; build with --mode agentic")
         return 1
+
+    if args.num_shards > 1:
+        qa = qa[args.shard::args.num_shards]
+        print(f"[agentic_eval] shard {args.shard}/{args.num_shards}: {len(qa)} items")
+        if not qa:
+            print("[agentic_eval] empty shard; nothing to do")
+            return 0
 
     infer = {"hf": _infer_hf, "vllm": _infer_vllm, "gguf": _infer_gguf}[args.backend]
     preds = infer(args, qa)
@@ -262,6 +286,8 @@ def main() -> int:
         "backend": args.backend,
     }
     out_dir = Path(args.out)
+    if args.num_shards > 1:
+        out_dir = out_dir / f"shard{args.shard}"
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2))

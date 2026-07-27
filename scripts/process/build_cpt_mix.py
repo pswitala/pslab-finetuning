@@ -42,7 +42,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from common.records import is_commercial_safe  # noqa: E402
+from common.records import is_commercial_safe, load_exclude_ids  # noqa: E402
 
 _SCHEMA_FIELDS = ("text", "domain", "source", "license")
 
@@ -59,7 +59,9 @@ def _open_text(path: str):
     return open(path, encoding="utf-8")
 
 
-_META_FIELDS = ("license", "source", "domain", "snapshot_date")
+# `id` is surfaced too so --exclude-ids can drop eval-holdout catalog records even after
+# datatrove nests the ingest fields under "metadata".
+_META_FIELDS = ("license", "source", "domain", "snapshot_date", "id")
 
 
 def iter_jsonl(globs: list[str]):
@@ -92,15 +94,19 @@ def license_ok(rec: dict, commercial_safe: bool) -> bool:
     return is_commercial_safe(rec.get("license", "unknown"))
 
 
-def count_docs(globs: list[str], commercial_safe: bool) -> tuple[int, int, dict[str, int]]:
+def count_docs(globs: list[str], commercial_safe: bool,
+               exclude_ids: set[str] | None = None) -> tuple[int, int, dict[str, int]]:
     """Stream-count docs with non-empty text (and, optionally, a safe license).
 
-    Returns (kept, license_skipped, per_source_counts).
+    Returns (kept, license_skipped, per_source_counts). Records whose id is in
+    exclude_ids (eval holdout) are not counted, matching the writing pass.
     """
     kept = skipped = 0
     per_source: dict[str, int] = collections.Counter()
     for rec in iter_jsonl(globs):
         if not (rec.get("text") or "").strip():
+            continue
+        if exclude_ids and rec.get("id") in exclude_ids:
             continue
         if commercial_safe and not license_ok(rec, True):
             skipped += 1
@@ -168,8 +174,16 @@ def main() -> int:
     ap.add_argument("--max-per-source", nargs="*", default=[], metavar="SOURCE=N",
                     help="cap docs kept per source via uniform random subsample, e.g. "
                          "--max-per-source gus_bdl=1000000. Uncapped sources unaffected.")
+    ap.add_argument("--exclude-ids", default=None,
+                    help="path to a holdout id manifest (from make_holdout.py); catalog "
+                         "records whose id is listed are excluded from the CPT mix to "
+                         "prevent eval-holdout leakage")
     ap.add_argument("--seed", type=int, default=3407)
     args = ap.parse_args()
+
+    exclude_ids = load_exclude_ids(args.exclude_ids)
+    if exclude_ids:
+        print(f"[build_cpt_mix] excluding {len(exclude_ids)} holdout ids")
 
     caps: dict[str, int] = {}
     for spec in args.max_per_source:
@@ -189,7 +203,8 @@ def main() -> int:
     rng = random.Random(args.seed)
 
     # Pass 1 — count (streaming) to size the EN replay stream and per-source caps.
-    n_pl_raw, skipped_lic, per_source = count_docs(args.pl, args.commercial_safe)
+    n_pl_raw, skipped_lic, per_source = count_docs(
+        args.pl, args.commercial_safe, exclude_ids)
     # Per-source caps: uniform random subsample down to the cap (same Bernoulli trick as
     # the EN replay), so a dominant source (e.g. 5.5M short GUS records) can be downweighted
     # without biasing toward whichever shard happened to stream first.
@@ -249,6 +264,8 @@ def main() -> int:
     for rec in iter_jsonl(args.pl):
         text = (rec.get("text") or "").strip()
         if not text:
+            continue
+        if exclude_ids and rec.get("id") in exclude_ids:
             continue
         if args.commercial_safe and not license_ok(rec, True):
             continue

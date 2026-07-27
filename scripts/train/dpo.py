@@ -8,8 +8,10 @@ Input format: jsonl with {"prompt": ..., "chosen": ..., "rejected": ...}.
 `prompt` may be a plain string or a list of chat messages.
 
 Usage:
-    python scripts/train/dpo.py --config configs/dpo.yaml
-    python scripts/train/dpo.py --config configs/dpo.yaml --merge
+    python scripts/train/dpo.py --config configs/dpo.yaml           # single GPU
+    torchrun --standalone --nproc_per_node=4 \
+        scripts/train/dpo.py --config configs/dpo.yaml              # 4-way DDP
+    python scripts/train/dpo.py --config configs/dpo.yaml --merge   # single process only
 """
 
 from __future__ import annotations
@@ -22,23 +24,27 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
     load_config, load_model_and_tokenizer, load_for_merge, merge_and_save, wandb_report_to,
-    make_training_callbacks,
+    make_training_callbacks, render_preference_to_text, distributed_training_args, rank0_print,
 )
 
 
-def load_pref_dataset(files_glob: str, tokenizer):
+def load_pref_dataset(files_glob: str, tokenizer, enable_thinking: bool = False):
     from datasets import load_dataset
     paths = glob.glob(files_glob, recursive=True)
     if not paths:
         raise FileNotFoundError(f"no files match {files_glob}")
     ds = load_dataset("json", data_files=paths, split="train")
 
-    # Both supported input shapes are passed through unchanged:
+    # Two supported input shapes:
     #   - Conversational (e.g. Dolci-Instruct-DPO-translated): prompt is a list of
     #     {role, content} dicts; chosen/rejected are lists/dicts.
     #   - Standard flat: prompt/chosen/rejected are plain strings.
-    # TRL DPOTrainer >= 0.15 handles both natively, so no per-example transform is
-    # needed. (Mixing a str prompt with list chosen/rejected within one file breaks TRL.)
+    # When enable_thinking is False we must render conversational data to text OURSELVES
+    # (with enable_thinking=False) — DPOTrainer's built-in chat-template application uses
+    # default kwargs and would leave <think> blocks in the labels. Flat-string examples
+    # pass through unchanged. When enable_thinking is True we let TRL handle it natively.
+    if not enable_thinking:
+        ds = ds.map(lambda ex: render_preference_to_text(tokenizer, ex, enable_thinking=False))
     return ds
 
 
@@ -55,7 +61,7 @@ def main() -> int:
             from unsloth import PatchDPOTrainer
             PatchDPOTrainer()
         except Exception as exc:  # noqa: BLE001
-            print(f"[dpo] PatchDPOTrainer skipped: {exc}")
+            rank0_print(f"[dpo] PatchDPOTrainer skipped: {exc}")
 
     if args.merge:
         loaded = load_for_merge(cfg)
@@ -63,17 +69,22 @@ def main() -> int:
         return 0
 
     loaded = load_model_and_tokenizer(cfg)
-    print(f"[dpo] backend={loaded.backend} base={cfg['base_model']}")
+    rank0_print(f"[dpo] backend={loaded.backend} base={cfg['base_model']}")
 
+    from accelerate import PartialState
     from trl import DPOTrainer, DPOConfig
 
-    train_ds = load_pref_dataset(cfg["train_files"], loaded.tokenizer)
-    eval_ds = None
-    if cfg.get("eval_files"):
-        try:
-            eval_ds = load_pref_dataset(cfg["eval_files"], loaded.tokenizer)
-        except FileNotFoundError:
-            pass
+    # The .map() render below is cached by datasets; letting rank 0 write the cache first
+    # avoids four concurrent writers for the same fingerprint. No-op single-process.
+    enable_thinking = cfg.get("enable_thinking", False)
+    with PartialState().local_main_process_first():
+        train_ds = load_pref_dataset(cfg["train_files"], loaded.tokenizer, enable_thinking)
+        eval_ds = None
+        if cfg.get("eval_files"):
+            try:
+                eval_ds = load_pref_dataset(cfg["eval_files"], loaded.tokenizer, enable_thinking)
+            except FileNotFoundError:
+                pass
 
     dpo_cfg = DPOConfig(
         output_dir=cfg["output_dir"],
@@ -86,7 +97,8 @@ def main() -> int:
         # chosen+rejected logits per sample, so an eval batch of 8 doubles the memory spike.
         per_device_eval_batch_size=cfg.get(
             "per_device_eval_batch_size", cfg.get("per_device_train_batch_size", 1)),
-        gradient_accumulation_steps=cfg.get("gradient_accumulation_steps", 8),
+        # gradient_accumulation_steps + DDP knobs; world-size aware (see configs' distributed:)
+        **distributed_training_args(cfg, default_grad_accum=8),
         learning_rate=float(cfg.get("learning_rate", 5e-6)),
         lr_scheduler_type=cfg.get("lr_scheduler", "cosine"),
         warmup_ratio=cfg.get("warmup_ratio", 0.05),
@@ -111,7 +123,7 @@ def main() -> int:
     )
     trainer.train()
     trainer.save_model(cfg["output_dir"])
-    print(f"[dpo] done -> {cfg['output_dir']}")
+    rank0_print(f"[dpo] done -> {cfg['output_dir']}")
     return 0
 
 

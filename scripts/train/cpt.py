@@ -5,9 +5,12 @@ QLoRA causal-LM training via Unsloth (TRL SFTTrainer in completion/packing mode 
 raw text). Adapts Qwen3.6-27B to Polish while replay data guards against forgetting.
 
 Usage:
-    python scripts/train/cpt.py --config configs/cpt.yaml
+    python scripts/train/cpt.py --config configs/cpt.yaml           # single GPU
+    torchrun --standalone --nproc_per_node=4 \
+        scripts/train/cpt.py --config configs/cpt.yaml              # 4-way DDP
+    # or: make cpt NPROC=4
 
-After training, merge the adapter for the SFT stage:
+After training, merge the adapter for the SFT stage (single process — not under torchrun):
     python scripts/train/cpt.py --config configs/cpt.yaml --merge
 """
 
@@ -21,7 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
     load_config, load_model_and_tokenizer, load_for_merge, merge_and_save, wandb_report_to,
-    make_training_callbacks,
+    make_training_callbacks, distributed_training_args, rank0_print,
 )
 
 
@@ -51,17 +54,22 @@ def main() -> int:
         return 0
 
     loaded = load_model_and_tokenizer(cfg)
-    print(f"[cpt] backend={loaded.backend} base={cfg['base_model']}")
+    rank0_print(f"[cpt] backend={loaded.backend} base={cfg['base_model']}")
 
+    from accelerate import PartialState
     from trl import SFTTrainer, SFTConfig
 
-    train_ds = load_text_dataset(cfg["train_files"])
-    eval_ds = None
-    if cfg.get("eval_files"):
-        try:
-            eval_ds = load_text_dataset(cfg["eval_files"])
-        except FileNotFoundError:
-            print("[cpt] no eval files found; skipping eval")
+    # Rank 0 builds the datasets cache first; the other ranks then hit it instead of all
+    # four decoding the same parquet shards and racing on the HF cache lock. No-op
+    # single-process.
+    with PartialState().local_main_process_first():
+        train_ds = load_text_dataset(cfg["train_files"])
+        eval_ds = None
+        if cfg.get("eval_files"):
+            try:
+                eval_ds = load_text_dataset(cfg["eval_files"])
+            except FileNotFoundError:
+                rank0_print("[cpt] no eval files found; skipping eval")
 
     sft_cfg = SFTConfig(
         output_dir=cfg["output_dir"],
@@ -74,7 +82,8 @@ def main() -> int:
         # (e.g. Gemma's ~256k) an eval batch of 8 OOMs even when batch=1 trains fine.
         per_device_eval_batch_size=cfg.get(
             "per_device_eval_batch_size", cfg.get("per_device_train_batch_size", 1)),
-        gradient_accumulation_steps=cfg.get("gradient_accumulation_steps", 8),
+        # gradient_accumulation_steps + DDP knobs; world-size aware (see configs' distributed:)
+        **distributed_training_args(cfg, default_grad_accum=8),
         learning_rate=float(cfg.get("learning_rate", 1e-4)),
         lr_scheduler_type=cfg.get("lr_scheduler", "cosine"),
         warmup_ratio=cfg.get("warmup_ratio", 0.03),
@@ -100,7 +109,7 @@ def main() -> int:
     )
     trainer.train()
     trainer.save_model(cfg["output_dir"])
-    print(f"[cpt] done -> {cfg['output_dir']} (run with --merge to produce merged/)")
+    rank0_print(f"[cpt] done -> {cfg['output_dir']} (run with --merge to produce merged/)")
     return 0
 
 
