@@ -1,7 +1,7 @@
 # Setup — Ubuntu, RTX 6000 Pro Blackwell (96 GB)
 
 Target: **Ubuntu**, 4× **NVIDIA RTX 6000 Pro Blackwell** (96 GB each, PCIe, no NVLink),
-compute capability `sm_120`, CUDA 12.9, running inside the **`vllm` virtualenv**.
+compute capability `sm_120`, CUDA 12.8, running inside the **`vllm` virtualenv**.
 
 Everything runs on a single card; multi-GPU is opt-in per run (`make cpt NPROC=4`). Ubuntu is
 required for multi-GPU specifically — **NCCL has no Windows build**, so a native Windows
@@ -14,11 +14,11 @@ checkout is single-GPU only.
 The following packages are **already installed** — do not reinstall them:
 
 ```
-torch==2.10.0              (with CUDA 12.9 nvidia packages)
-transformers==5.5.0
+torch==2.10.0              (with CUDA 12.8 nvidia packages — nvidia-*-cu12==12.8.x)
+transformers==5.5.0        (requirements.txt pins 5.12.1 — pip will upgrade this)
 tokenizers==0.22.2
 safetensors==0.7.0
-huggingface_hub==1.9.0
+huggingface_hub==1.9.0     (requirements.txt pins 1.21.0 — pip will upgrade this)
 sentencepiece==0.2.1
 protobuf==6.33.6
 numpy==2.2.6
@@ -160,7 +160,7 @@ chmod +x scripts/check_env.py scripts/**/*.py
 ```bash
 python3 scripts/check_env.py
 # Expected output:
-#   torch.__version__         2.10.0+cu129  (or similar)
+#   torch.__version__         2.10.0+cu128  (or similar)
 #   cuda available            True
 #   name                      NVIDIA RTX 6000 Pro Blackwell
 #   compute capability        sm_120 (12.0)
@@ -178,7 +178,7 @@ Both should complete without errors.
 
 | Problem | Fix |
 |---|---|
-| `sm_120` bf16 test fails | `torch==2.10.0` should support sm_120; if not, reinstall from `--index-url https://download.pytorch.org/whl/cu129` |
+| `sm_120` bf16 test fails | `torch==2.10.0` should support sm_120; if not, reinstall from `--index-url https://download.pytorch.org/whl/cu128` (**cu128**, matching the pinned `nvidia-*-cu12==12.8.x` wheels — a cu129 build conflicts with them) |
 | `bitsandbytes` CUDA error on Blackwell | `pip install bitsandbytes --upgrade` |
 | `flash-attn` not found error | Do not install flash-attn — `flashinfer` is already present and handles this |
 | Unsloth `FastLanguageModel` fails on Qwen3.6 | Expected — PEFT fallback is automatic |

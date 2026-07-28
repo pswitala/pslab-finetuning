@@ -33,7 +33,10 @@ lora:
 # Data: packed parquet produced by scripts/process/build_cpt_mix.py
 train_files: data/processed/cpt/train/*.parquet
 eval_files: data/processed/cpt/val/*.parquet
-replay_fraction: 0.18      # consumed by scripts/process/build_cpt_mix.py (--replay-fraction), not the trainer; kept here as the canonical value
+# DOCUMENTATION ONLY — nothing reads this key. build_cpt_mix.py never loads this file; the
+# replay fraction is set by its --replay-fraction CLI flag (default 0.18). This value can
+# silently drift from what was actually passed when the mix was built.
+replay_fraction: 0.18
 
 # Packing: enabled for CPT efficiency (~8x fewer steps than packing=false).
 # flash-linear-attention + causal-conv1d are installed so SSM layers use fast kernels.

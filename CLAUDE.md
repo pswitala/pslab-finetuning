@@ -6,14 +6,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 End-to-end QLoRA fine-tuning pipeline for Qwen3.6-27B targeting Polish language fluency and knowledge injection from Polish open-data catalogs. Knowledge is baked into model weights (no RAG). Final artifacts are GGUF-quantized models for llama.cpp/Ollama.
 
-Hardware target: 4× NVIDIA RTX 6000 Pro Blackwell, 96 GB VRAM each, CUDA 12.9, compute capability sm_120. No NVLink — the cards are PCIe-connected, which is why training scales via DDP (one full replica per card, only LoRA gradients all-reduced) rather than FSDP/DeepSpeed, and why eval fans out data-parallel rather than using tensor parallelism.
+Hardware target: 4× NVIDIA RTX 6000 Pro Blackwell, 96 GB VRAM each, CUDA 12.8, compute capability sm_120. No NVLink — the cards are PCIe-connected, which is why training scales via DDP (one full replica per card, only LoRA gradients all-reduced) rather than FSDP/DeepSpeed, and why eval fans out data-parallel rather than using tensor parallelism.
 
 ## Commands
 
 ### Verify environment before any training
 ```bash
 python scripts/check_env.py
-# Expect: torch 2.10.0, CUDA 12.9, sm_120, ~96 GB VRAM, bf16 matmul OK
+# Expect: torch 2.10.0, CUDA 12.8, sm_120, ~96 GB VRAM, bf16 matmul OK
+# requirements.txt pins nvidia-*-cu12==12.8.x — install torch from the cu128 index, not cu129.
 ```
 
 ### Install dependencies
@@ -96,7 +97,9 @@ The model is also a **Vision-Language Model** (`Qwen3_5ForConditionalGeneration`
 
 ```
 Polish APIs (Sejm/ISAP, dane.gov.pl, GUS BDL)
-    → data/catalogs/  (~5.5M records with source/license/snapshot_date)
+    → data/catalogs/  (records carry source/license/snapshot_date; GUS BDL alone is ~5.5M)
+    → make_holdout.py splits this into data/catalogs_train/ + data/catalogs_holdout/
+      ALL dataset builders must read data/catalogs_train/, never data/catalogs/ (holdout leak)
 
 HuggingFace corpora (HPLT 2.0 PL, Wikipedia PL, CulturaX PL, Dolci SFT/DPO, EN replay)
     → data/raw/  (~500+ GB, gitignored)
@@ -153,4 +156,16 @@ All ingested records carry: `text`, `source`, `license`, `snapshot_date`, and so
 
 ## English Retention Monitoring
 
-CPT runs MMLU/HellaSwag/ARC on an English subset every 500 steps to detect catastrophic forgetting. If English scores drop significantly, increase the English replay ratio in `build_cpt_mix.py` (currently 18%).
+Retention is measured **out-of-band**, not inside the trainer. There is no in-training English
+benchmark: `english_retention_check` is commented out in `configs/cpt.yaml` and nothing in
+`scripts/train/` reads it. To check for catastrophic forgetting, evaluate a checkpoint against
+the base model:
+
+```bash
+python scripts/eval/run_eval.py --peft models/cpt/checkpoint-2000 \
+    --base-model Qwen/Qwen3.6-27B --suite english
+```
+
+If English scores drop >3% below baseline, rebuild the CPT mix with a higher replay fraction —
+`build_cpt_mix.py --replay-fraction 0.22` (it is a CLI flag, not a constant in the script; the
+`replay_fraction` key in `configs/cpt.yaml` is documentation only and is read by nothing).
